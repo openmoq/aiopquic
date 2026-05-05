@@ -96,12 +96,20 @@ def _client_config() -> QuicConfiguration:
     )
 
 
-# Floors set on first measurement under released 0.2.0 wheel.
+# Floors set 2026-05-05 against local 0.2.1 build (Change A +
+# 1x ring). Set ~80% of measured steady-state to absorb host noise
+# without false-failing on real regressions.
+#
+# Measured (30s steady-state, single uni stream, line rate):
+#   1 KiB:  228K obj/s, 1,871 Mbps
+#   4 KiB:   72K obj/s, 2,354 Mbps
+#  16 KiB:   18K obj/s, 2,387 Mbps
+#
 # Update with measurement evidence; never lower silently.
 HIGHLEVEL_MIN_MBPS = {
-    1024:  None,   # to be measured
-    4096:  None,
-    16384: None,
+    1024:  1500,    # measured 1,871 -> floor at 80%
+    4096:  1900,    # measured 2,354 -> floor at 80%
+    16384: 1900,    # measured 2,387 -> floor at 80%
 }
 
 
