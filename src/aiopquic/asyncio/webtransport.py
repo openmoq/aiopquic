@@ -503,7 +503,15 @@ async def connect_webtransport(
     `transport` defaults to a fresh TransportContext started in client
     mode (alpn='h3', max_datagram_frame_size=64KB); pass an existing
     one to share rings/threading across multiple sessions.
+
+    Empty path "" is normalized to "/" — HTTP/3 root request semantics
+    (RFC 9114 §4.3.1). Picoquic's path-match is exact, so registering
+    "" on the server side and connecting with "" both fail to route
+    against a peer that uses the literal "/". Normalizing here keeps
+    consumers from having to think about it.
     """
+    if path == "":
+        path = "/"
     own_transport = transport is None
     if own_transport:
         transport = TransportContext()
@@ -569,7 +577,14 @@ async def serve_webtransport(
     handler(session) is invoked once per accepted CONNECT.
     session_factory(transport, state) constructs each session;
     defaults to WebTransportServerSession.
+
+    Empty path "" is normalized to "/" — picoquic's path table is
+    exact-match (no default route), and HTTP/3 clients send `:path: /`
+    for root requests (RFC 9114 §4.3.1). Without normalization, a
+    server registered with "" never matches a root-path CONNECT.
     """
+    if path == "":
+        path = "/"
     own_transport = transport is None
     if own_transport:
         transport = TransportContext()

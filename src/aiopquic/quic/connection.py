@@ -554,14 +554,35 @@ class QuicEngine:
                 self._protocols.pop(cnx_ptr, None)
 
     def close(self) -> None:
-        """Tear down all connections and stop the transport."""
+        """Tear down all connections and stop the transport.
+
+        Order matters: stop the transport (joins the picoquic worker
+        thread, then runs picoquic_free which fires picoquic_callback_close
+        on the per-cnx callback for every cnx) BEFORE clearing
+        self._connections / self._protocols. picoquic_free's close
+        callbacks push _EVT_CLOSE events to the SPSC RX ring; those
+        events carry per-stream wrapper (aiopquic_stream_ctx_t*)
+        pointers picoquic still holds via app_stream_ctx. If we cleared
+        Python state first, GC could destroy QuicConnection objects
+        whose _stream_ctxs dicts hold the same wrapper pointers, and
+        picoquic_free would then walk freed memory.
+
+        Pre-2026-05-05 ordering (clear-then-stop) reproduced an
+        intermittent SEGV in transport.stop on aiomoqt full pytest
+        ~10% of runs.
+        """
+        # Push CLOSE events for any still-open cnxs; the worker will
+        # drain these as it goes through teardown inside transport.stop.
         for proto in list(self._protocols.values()):
             try:
                 proto.close()
             except Exception:
                 pass
-        self._connections.clear()
-        self._protocols.clear()
+        # Stop transport first — joins worker, runs picoquic_free,
+        # fires every close callback while Python wrappers are alive.
         if self._transport is not None:
             self._transport.stop()
             self._transport = None
+        # Now safe to drop Python state; picoquic is fully torn down.
+        self._connections.clear()
+        self._protocols.clear()

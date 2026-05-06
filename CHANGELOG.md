@@ -1,5 +1,98 @@
 # Changelog
 
+## v0.2.2 (2026-05-06)
+
+Stability release. Closes the close-time segfault that survived 0.2.1
+on full integration matrices (e.g. aiomoqt's pytest suite). 100/100
+clean across the new aiomoqt regression workload (was 15/100 on 0.2.1
+release wheel, 6/100 after the picoquic upstream perf bump alone).
+
+### Fix
+
+**Double-close race on `picoquic_close()`.** Pattern: peer-initiated
+`CONNECTION_CLOSE` arrives at the worker; our `aiopquic_stream_cb`
+queues an `_EVT_CLOSE` to the RX SPSC ring; **before the asyncio
+thread drains and sets `self._closed = True`**, application code
+(typically a test fixture's `finally:` clause) calls
+`QuicConnection.close()` which pushes a `_TX_CLOSE` event. The worker
+drains the `_TX_CLOSE` and calls `picoquic_close()` on a cnx whose
+state is already `picoquic_state_disconnected`. picoquic's
+`picoquic_close_ex` (sender.c) sets `ret = -1` for the already-closed
+branch but **falls through** to `picoquic_reinsert_by_wake_time`,
+which manipulates wake-list state cleaned up at the original close.
+UAF / inconsistent-list-pointer crash on the worker thread.
+
+The fix lives in our TX_CLOSE handler ([callback.h](src/aiopquic/_binding/c/callback.h)):
+filter out the call when cnx state is already terminal.
+
+```c
+case SPSC_EVT_TX_CLOSE: {
+    picoquic_state_enum st = picoquic_get_cnx_state(cnx);
+    if (st < picoquic_state_disconnecting) {
+        picoquic_close(cnx, entry->error_code);
+    }
+    spsc_ring_pop(ctx->tx_ring);
+    break;
+}
+```
+
+Filed picoquic upstream issue suggesting `picoquic_close_ex` should
+early-return on the already-closed branch.
+
+### Other changes
+
+- **picoquic submodule bumped** to `f54239a3` (upstream master HEAD as
+  of 2026-05-04). Pulls in #2095 — "perf: split due-now connections
+  out of the wake tree" — independently reduced segfault rate from
+  15% to 6% by tightening the worker-loop timing window. Also
+  includes:
+  - #2092 RFC 9000 fixes
+  - #2086 WebTransport authority exposure
+  - #2085 wildcard `*` path matcher for WebTransport CONNECT
+  - #2052 unidirectional stream leak fix (relevant to subgroup-heavy
+    workloads)
+
+- **`engine.close()` ordering fix** ([connection.py](src/aiopquic/quic/connection.py)):
+  stop the transport (which joins the worker and runs `picoquic_free`,
+  firing close callbacks while Python state is alive) before clearing
+  `self._connections` / `self._protocols`. The prior order risked
+  Python-side cnx wrappers being GC'd before picoquic_free's per-cnx
+  close callbacks fired. Defensive correctness; not load-bearing for
+  this segfault but the right invariant.
+
+- **WebTransport empty-path normalization** ([webtransport.py](src/aiopquic/asyncio/webtransport.py)):
+  `path == ""` is now normalized to `"/"` in both `serve_webtransport`
+  and `connect_webtransport`. picoquic's path table is exact-match
+  with no default route, while HTTP/3 clients send `:path: /` for
+  root requests (RFC 9114 §4.3.1). Prior behavior: empty-path setups
+  silently failed CONNECT with `code=2`.
+
+### New regression benches
+
+- `tests/bench/bench_stream_churn_highlevel.py` — many short-lived
+  uni streams, each with N small objects + FIN, byte-verified. 10/10
+  cases pass; peak 8,675 streams/s at 500-stream churn (1 KiB × 16
+  objs each).
+- `tests/bench/bench_concurrent_streams_highlevel.py` — N parallel
+  uni streams on one cnx, round-robin object dispatch, byte-verified.
+  11/11 cases pass; peak 3,141 Mbps at P=64 × 16 KiB.
+- `bench_baselines_highlevel.py` `HIGHLEVEL_MIN_MBPS` floor locked at
+  1500 / 1900 / 1900 Mbps (1K / 4K / 16K) — ~80% of measured.
+
+### Verification
+
+- 100x aiomoqt full pytest under release-equivalent build (`-O3 -g`):
+  0 segfaults, 0 byte-conservation failures across all 13 cases of
+  AB7 stream-object stress, 10/10 AB8, 11/11 AB9.
+- Perf preserved: 1 KiB single-stream sustained throughput within
+  noise of v0.2.1 baseline (302,786 obj/s @ 2,480 Mbps vs prior 305K
+  @ 2,499 Mbps). picoquic #2095 should also help multi-cnx workloads
+  on the worker hot path; not visible in single-cnx benches.
+
+All 0.2.0 / 0.2.1 byte-conservation guarantees preserved. Pull model
+unchanged.
+
+
 ## v0.2.1 (2026-05-05)
 
 Stability + performance fix release. Targets an intermittent segfault
