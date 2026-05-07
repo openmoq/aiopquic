@@ -325,11 +325,11 @@ async def _run(obj_size: int, duration_s: float,
 @pytest.mark.bench
 @pytest.mark.parametrize("obj_size", list(HIGHLEVEL_MIN_MBPS.keys()),
                           ids=lambda s: f"{s}B")
-@pytest.mark.parametrize("duration_s", [30.0], ids=["30s"])
-def test_bench_sustained_baseline_highlevel(obj_size, duration_s):
+def test_bench_sustained_baseline_highlevel(obj_size, bench_duration):
     """Sustained line-rate single-stream baseline through the
     high-level QuicConnection API. Companion to the lower-level
     SPSC-direct baseline; gap between the two = cost of the wrapper."""
+    duration_s = bench_duration
     res = asyncio.run(_run(obj_size, duration_s, warmup_s=2.0))
     print(f"\n  --- highlevel baseline obj={obj_size}B "
           f"duration={duration_s:.0f}s ---")

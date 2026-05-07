@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.2.6 (2026-05-07)
+
+### Bench: `--duration` pytest option for opt-in benches
+
+Added a `--duration` flag to the bench pytest config (default 30.0s).
+The new `bench_duration` fixture exposes it to benches that opt in.
+
+Wired into `bench_baselines_highlevel.py` and `bench_baselines_lowlevel.py`,
+which previously used a hardcoded `[30.0]` parametrize. Other benches
+that intentionally compare multiple windows (e.g. `bench_small_object_rate`
+uses `[2.0, 5.0]`, `bench_throughput_pullmodel` uses `[1.0, 5.0]`)
+keep their own parametrize lists.
+
+Background: short-window microbenches inflate sustained-rate numbers
+3–10× from warmup transients. A run of `bench_stream_churn_highlevel`
+showed the same `4o-256B` parametrize jumping from 823 Mbps at 100
+streams down to 305 Mbps at 1000 streams — only the longer window
+converged to the true sustained rate. The `--duration` knob lets
+qualifying runs hold the measurement window long enough for
+convergence without rebuilding fixed-N benches.
+
+Library API unchanged.
+
 ## v0.2.5 (2026-05-07)
 
 ### Concurrent WT `create_stream` correctness fix

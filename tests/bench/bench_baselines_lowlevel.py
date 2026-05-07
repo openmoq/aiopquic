@@ -76,10 +76,10 @@ BASELINE_MIN_MBPS = {
 @pytest.mark.bench
 @pytest.mark.parametrize("obj_size", list(BASELINE_MIN_MBPS.keys()),
                           ids=lambda s: f"{s}B")
-@pytest.mark.parametrize("duration_s", [30.0], ids=["30s"])
-def test_bench_sustained_baseline(big_ring_pair, obj_size, duration_s):
-    """Sustained line-rate single-stream baseline. 30s = ~25× the
-    ring-fill window, so buffer-fill transients are < 4% of the run."""
+def test_bench_sustained_baseline(big_ring_pair, obj_size, bench_duration):
+    """Sustained line-rate single-stream baseline. Default 30s = ~25× the
+    ring-fill window so buffer-fill transients are < 4% of the run."""
+    duration_s = bench_duration
     server, client, client_cnx, _ = big_ring_pair
     sid = 0
 

@@ -6,6 +6,22 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--duration", action="store", default=30.0, type=float,
+        help="Per-case bench duration in seconds for benches that opt "
+             "into the `bench_duration` fixture. Default 30.0. Benches "
+             "with intentional multi-duration parametrize (e.g. stepped "
+             "latency runs) ignore this and keep their list.",
+    )
+
+
+@pytest.fixture
+def bench_duration(request):
+    """Per-case duration in seconds, default 30.0, override via --duration."""
+    return request.config.getoption("--duration")
+
 from _helpers import (  # noqa: E402
     ALPN, CERT_FILE, KEY_FILE,
     next_port, wait_for_ready,
