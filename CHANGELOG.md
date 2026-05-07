@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.2.3 (2026-05-07)
+
+Wheel-build perf release. Closes the ~30% throughput / ~36× p50
+latency gap between the manylinux wheel and locally-built artifacts
+on AMD Ryzen.
+
+### Change
+
+Switched the Linux wheel base image from `manylinux_2_28` (RHEL 8 /
+OpenSSL 1.1.1k) to `manylinux_2_34` (RHEL 9 / OpenSSL 3.5.1).
+RHEL 8's OpenSSL 1.1.1k FIPS build routes through crypto-policies
++ FIPS-provider overhead that takes a slower ASM path on Ryzen even
+with `AESNI_ASM` / `GHASH_ASM` / `X25519_ASM` compile-time defines
+present. OpenSSL 3.x doesn't have this overhead. The manylinux
+container's gcc version (14.2.1) was previously suspected but ruled
+out via A/B test: gcc-toolset-11 in `_2_28` produced even slower
+wheels (148K obj/s @ 1K vs 185K with default gcc 14).
+
+### Verification
+
+30s sustained `bench_baselines_lowlevel` 1K loopback, AMD Ryzen,
+WSL2, Python 3.14:
+
+| metric              | 0.2.2 wheel | 0.2.3 wheel | local source |
+|---------------------|-------------|-------------|--------------|
+| obj/s               | 185,712     | 278,061     | 250,391      |
+| Mbps                | 1,521       | 2,278       | 2,051        |
+| latency floor µs    | (n/a)       | 11          | 12           |
+| latency p50 µs      | 5,478       | 107         | 150          |
+| latency p99 µs      | (n/a)       | 886         | 1,774        |
+| latency max µs      | (n/a)       | 6,058       | 14,502       |
+
+AB7 stream-object stress: 13/13 byte-perfect.
+AB8 stream-churn: 10/10 byte-perfect.
+AB9 concurrent streams: 11/11 byte-perfect, peak 4,623 Mbps at
+P=64 × 16 KiB.
+
+### Compatibility trade-off
+
+Wheel compatibility narrows from glibc 2.28 (RHEL 8 / Ubuntu 20.04)
+to glibc 2.34 (RHEL 9 / Ubuntu 22.04). Older Linux systems install
+via sdist (no behavioral change for them). Apple Silicon macOS
+wheels are unchanged.
+
+### Build configuration
+
+- `[tool.cibuildwheel.linux.environment]` block pins
+  `CFLAGS=-O3 -fno-strict-overflow -fPIC` and
+  `PICOQUIC_C_FLAGS=-O3 -DNDEBUG`.
+- `build_picoquic.sh` honors `PICOQUIC_C_FLAGS` via
+  `-DCMAKE_C_FLAGS_RELEASE=...` for picoquic + picotls compile.
+
+All 0.2.0 / 0.2.1 / 0.2.2 byte-conservation guarantees preserved.
+Pull model unchanged. No source-code changes outside build config.
+
+
 ## v0.2.2 (2026-05-06)
 
 Stability release. Closes the close-time segfault that survived 0.2.1
