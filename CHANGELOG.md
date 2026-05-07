@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.2.5 (2026-05-07)
+
+### Concurrent WT `create_stream` correctness fix
+
+`WebTransportSession.create_stream()` previously serialized
+concurrent callers via `asyncio.shield(self._pending_create)` with a
+single-slot pending future. The pattern is racy with three or more
+concurrent callers: when the first response arrives, the second
+caller wakes and installs a new `_pending_create` future, but a
+third (also waking from the same shield) overwrites it with its
+own future before the second's response lands. The second's
+`wait_for` then times out after 5s, dropping the stream.
+
+Symptom in aiomoqt: `PublishedTrack` with `num_subgroups=P > 2`
+silently drops `P − 2` subgroups under load — observed transmit
+rate is `target × 2 / P` instead of `target`.
+
+Replaced the single-slot design with a FIFO `deque` of pending
+futures. Each caller appends its own future and awaits it
+individually. The `WT_STREAM_CREATED` handler `popleft`'s and
+resolves. Picoquic processes the TX ring serially and emits
+responses in the same order, so 1:1 pairing is correct.
+
+No locks added — single-threaded asyncio + SPSC ring ordering is
+sufficient. Per-stream cost: same big-O as before (one future
+allocation, one deque op). Concurrent open path is now actually
+faster, since the old shield path added an extra context switch
+per waiter that the deque path skips.
+
+`SESSION_CLOSED` also fails any still-pending creates with a
+`WebTransportError` so callers don't sit on the 5s timeout.
+
 ## v0.2.4 (2026-05-07)
 
 Two correctness fixes upstream from us, plus README cleanup.

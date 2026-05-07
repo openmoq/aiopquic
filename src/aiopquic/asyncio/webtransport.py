@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+from collections import deque
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -92,8 +93,11 @@ class WebTransportSession:
         self._session_closed = asyncio.Event()
         self._session_close_event: WebTransportSessionClosed | None = None
         self._draining = False
-        # Stream creation (single outstanding)
-        self._pending_create: asyncio.Future | None = None
+        # Stream creation: FIFO of pending futures. Each create_stream()
+        # call appends a future; the WT_STREAM_CREATED handler popleft's
+        # and resolves it. Picoquic processes the TX ring serially and
+        # emits responses in the same order, so 1:1 pairing is correct.
+        self._pending_creates: deque[asyncio.Future] = deque()
         # Per-stream incoming queues
         self._stream_inbox: dict[int, asyncio.Queue] = {}
         # Datagrams + general event stream
@@ -156,19 +160,22 @@ class WebTransportSession:
         """Open a new WT stream. Returns the assigned stream_id.
 
         Round-trips to the picoquic thread because picowt allocates
-        the id internally. Codec rates (3-4 streams/sec/session)
-        make this round-trip cost negligible."""
+        the id internally. Multiple concurrent callers are safe:
+        each appends a future to a FIFO and picoquic responds in
+        the same order TX events were pushed."""
         if not self.session_ready:
             raise WebTransportError("session not ready")
-        if self._pending_create is not None:
-            await asyncio.shield(self._pending_create)
-        self._pending_create = self._loop.create_future()
+        fut = self._loop.create_future()
+        self._pending_creates.append(fut)
         self._state.push_create_stream(bidir)
         try:
-            sid = await asyncio.wait_for(self._pending_create,
-                                           timeout=timeout)
-        finally:
-            self._pending_create = None
+            sid = await asyncio.wait_for(fut, timeout=timeout)
+        except BaseException:
+            try:
+                self._pending_creates.remove(fut)
+            except ValueError:
+                pass
+            raise
         if sid == 0:
             raise WebTransportError("WT stream create rejected")
         return sid
@@ -262,16 +269,25 @@ class WebTransportSession:
                     and not self._session_ready.done()):
                 self._session_ready.set_exception(WebTransportError(
                     "WT session closed before READY"))
+            # Fail any pending create_stream() callers; the session
+            # is gone, no point making them wait for the timeout.
+            while self._pending_creates:
+                fut = self._pending_creates.popleft()
+                if not fut.done():
+                    fut.set_exception(WebTransportError(
+                        "WT session closed"))
             self._event_queue.put_nowait(ev)
         elif evt_type == _EVT_WT_SESSION_DRAINING:
             self._draining = True
             self._event_queue.put_nowait(WebTransportSessionDraining())
         elif evt_type == _EVT_WT_STREAM_CREATED:
-            if self._pending_create and not self._pending_create.done():
-                if error_code != 0:
-                    self._pending_create.set_result(0)
-                else:
-                    self._pending_create.set_result(sid)
+            # Pair with the oldest pending create_stream() caller.
+            # Skip already-cancelled futures (caller timed out / closed).
+            while self._pending_creates:
+                fut = self._pending_creates.popleft()
+                if not fut.done():
+                    fut.set_result(0 if error_code != 0 else sid)
+                    break
         elif evt_type == _EVT_WT_STREAM_DATA:
             payload = data if data is not None else memoryview(b"")
             ev = WebTransportStreamDataReceived(
