@@ -46,39 +46,25 @@ Tests pass on Linux and macOS. The interop suite is opt-in (network-dependent).
 
 ### Performance
 
-Single-host loopback on AMD Ryzen 7 PRO 7840U (Zen 4), Linux, Python 3.14, against the released wheel (manylinux_2_34, OpenSSL 3.5.1). Byte-perfect across every run.
+Sustained single-stream throughput, 30s steady-state, byte-verifying, high-level asyncio API (`QuicConnection.send_stream_data` — what client libraries see):
 
-**Single-stream sustained (30s, lowlevel SPSC ring):**
-
-| obj | obj/s | throughput | latency p50 | latency p99 |
-|---|---|---|---|---|
-| 1 KiB | 293K | 2,400 Mbps | 98 µs | 834 µs |
-| 4 KiB | 83K | 2,732 Mbps | 3,139 µs | 4,798 µs |
-| 16 KiB | 21K | 2,746 Mbps | 3,142 µs | 5,029 µs |
-
-**High-level API (`QuicConnection.send_stream_data`, what client libraries see, 30s):**
-
-| obj | obj/s | throughput | latency p50 |
+| platform | 1 KiB | 4 KiB | 16 KiB |
 |---|---|---|---|
-| 1 KiB | 229K | 1,875 Mbps | 370 µs |
-| 4 KiB | 74K | 2,439 Mbps | 3,488 µs |
-| 16 KiB | 18K | 2,424 Mbps | 3,509 µs |
+| AMD Ryzen 7 PRO 7840U / WSL2 / Linux 6.6 | 1,570 Mbps | 2,118 Mbps | 2,031 Mbps |
+| Apple M-series / macOS Sonnoma | 953 Mbps | 1,130 Mbps | 1,104 Mbps |
 
-**Multi-stream (concurrent streams on one connection, line rate):**
+Numbers are local UDP loopback. **The kernel's UDP loopback is the ceiling on every platform we've measured** — picoquic native (`picoquicdemo -a perf`) on Ryzen WSL2 sustains 2,184 Mbps single-stream, and `aiopquic`'s lowlevel SPSC path lands at 2,322 Mbps for the same workload, so the 30 % gap to "wire" comes from the asyncio wrapper at small object sizes, much less above 4 KiB. Above this, throughput doesn't scale with concurrent streams (Ryzen P=64 × 16 KiB ≈ same 2 Gbps wall) — it's the kernel UDP path, not picoquic.
 
-| P × obj | streams complete | obj/s | throughput |
-|---|---|---|---|
-| 64 × 4 KiB | 64/64 | 97K | 3,190 Mbps |
-| 256 × 4 KiB | 256/256 | 91K | 2,983 Mbps |
-| 64 × 16 KiB | 64/64 | 42K | **5,481 Mbps** |
+For platform-independent **protocol-only** measurements (no kernel UDP), use `picoquicdemo -a perf` on your hardware as the calibration reference, or wait for the upcoming `sim_link` bench harness on this branch's roadmap (binds picoquic's in-process simulated-link API to Python).
 
-**Stream churn (open/send/FIN, byte-verifying):**
+Calibrate on your own hardware:
 
-| streams × obj | streams/s | throughput |
-|---|---|---|
-| 1000 × 4 obj × 256 B | 48,654 | 399 Mbps |
-| 100 × 16 obj × 1 KiB | 12,600 | 1,651 Mbps |
-| 200 × 64 obj × 4 KiB | 1,723 | 3,614 Mbps |
+```bash
+pytest tests/bench/bench_baselines_highlevel.py -s -v          # default 30 s
+pytest tests/bench/bench_baselines_highlevel.py -s -v --duration=60
+```
+
+Microbenches (ring lifecycle, stream churn, concurrent-streams short bursts) live under `tests/bench/` for development reference but are **not** representative of sustained throughput — short windows inflate numbers from warmup transients.
 
 ## Installation
 
