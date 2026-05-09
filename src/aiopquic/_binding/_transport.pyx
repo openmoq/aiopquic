@@ -195,11 +195,17 @@ cdef extern from "c/callback.h":
         uint64_t worker_mark_active_processed
         uint64_t worker_prepare_to_send_calls
         uint64_t worker_prepare_to_send_pulled_bytes
+        uint64_t worker_rx_event_drops
+        uint64_t worker_rx_event_drops_stream_data
+        uint64_t worker_rx_byte_ring_overflow
+        uint32_t rx_notify_pending
+        uint32_t tx_wake_pending
 
     aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity)
     void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx)
     void aiopquic_clear_rx(aiopquic_ctx_t* ctx)
     void aiopquic_notify_rx(aiopquic_ctx_t* ctx)
+    int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx)
 
     int aiopquic_stream_cb(picoquic_cnx_t* cnx, uint64_t stream_id,
                             uint8_t* bytes, size_t length,
@@ -360,7 +366,7 @@ cdef extern from "c/h3wt_callback.h":
 
 
 # Default ring sizing
-DEF DEFAULT_RING_CAPACITY = 4096
+DEF DEFAULT_RING_CAPACITY = 262144
 
 
 cdef class StreamChunk:
@@ -569,9 +575,14 @@ cdef class TransportContext:
         For WebTransport events: cnx_ptr is the picoquic_cnx_t*,
         stream_ctx_ptr is the aiopquic_wt_session_t* — used for routing
         events to the right WT session in the asyncio side.
-        """
-        aiopquic_clear_rx(self._ctx)
 
+        Order matters: drain entries FIRST, then call aiopquic_clear_rx
+        which atomically (a) clears the producer-skip flag, (b) drains
+        the wake-fd counter, (c) re-arms via a fresh wake-fd write if
+        the ring is still non-empty (race recovery for producers that
+        observed pending=1 and skipped their own wake while we were
+        partway through draining).
+        """
         events = []
         cdef int i
         cdef spsc_entry_t* entry
@@ -629,6 +640,7 @@ cdef class TransportContext:
             ))
             spsc_ring_pop(self._ctx.rx_ring)
 
+        aiopquic_clear_rx(self._ctx)
         return events
 
     def push_tx(self, uint32_t event_type, uint64_t stream_id,
@@ -737,9 +749,16 @@ cdef class TransportContext:
             self._send_busy_event_ring += 1
             return 1
 
-        # Wake the worker thread so it picks up the event quickly.
+        # Coalesce the wake_up syscall: only invoke
+        # picoquic_wake_up_network_thread on the 0→1 transition of
+        # tx_wake_pending. The worker clears the flag back to 0 on
+        # entry to its wake handler (BEFORE draining the tx ring), so
+        # any push that races against the worker drain is guaranteed
+        # to either land in the ring before the drain loop's next peek
+        # OR cause a fresh wake.
         if self._thread_ctx is not NULL:
-            picoquic_wake_up_network_thread(self._thread_ctx)
+            if aiopquic_tx_wake_set_pending(self._ctx) == 0:
+                picoquic_wake_up_network_thread(self._thread_ctx)
 
         return 0
 
@@ -786,6 +805,30 @@ cdef class TransportContext:
         prepare_to_send. Should equal total bytes Python pushed across
         all streams once everything is drained."""
         return self._ctx.worker_prepare_to_send_pulled_bytes
+
+    @property
+    def worker_rx_event_drops(self):
+        """Worker thread: count of events dropped because the RX
+        event ring (rx_ring) was full at push time. For stream_data
+        events the bytes ARE in sc->rx but Python is never notified —
+        Python only pops sc->rx if a LATER event for the same stream
+        pushes successfully. This is the stream-loss bug root cause."""
+        return self._ctx.worker_rx_event_drops
+
+    @property
+    def worker_rx_event_drops_stream_data(self):
+        """Subset of worker_rx_event_drops that were stream_data /
+        stream_fin events (vs control events like datagram/close)."""
+        return self._ctx.worker_rx_event_drops_stream_data
+
+    @property
+    def worker_rx_byte_ring_overflow(self):
+        """Worker thread: count of per-stream RX byte-ring overflow
+        events. Indicates the peer sent more bytes than its
+        flow-control window allowed (spec violation). Previously
+        printed to stderr per occurrence; now silent unless
+        AIOPQUIC_RX_LOG=1 is set in the env."""
+        return self._ctx.worker_rx_byte_ring_overflow
 
     def start(self, int port=0, cert_file=None, key_file=None,
               alpn=None, bint is_client=True, uint64_t idle_timeout_ms=30000,

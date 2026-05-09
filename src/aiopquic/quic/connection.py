@@ -136,7 +136,16 @@ class QuicConnection:
         if self._transport is not None:
             return
         cfg = self._configuration
-        self._transport = TransportContext()
+        # SPSC event ring capacity: configurable via QuicConfiguration.
+        # None defers to the Cython compile-time default. High-rate
+        # stream-churn workloads (multi-Gbps with many short streams)
+        # need this larger to avoid silent stream_data event drops on
+        # the receiver side.
+        if cfg.event_ring_capacity is not None:
+            self._transport = TransportContext(
+                ring_capacity=cfg.event_ring_capacity)
+        else:
+            self._transport = TransportContext()
         # SSLKEYLOGFILE env var as a fallback when configuration didn't
         # set secrets_log_file explicitly — matches the convention used
         # by curl, openssl s_client, and Chromium-based tooling.
@@ -489,7 +498,11 @@ class QuicEngine:
         if self._transport is not None:
             return
         cfg = self._configuration
-        self._transport = TransportContext()
+        if cfg.event_ring_capacity is not None:
+            self._transport = TransportContext(
+                ring_capacity=cfg.event_ring_capacity)
+        else:
+            self._transport = TransportContext()
         keylog = cfg.secrets_log_file or os.environ.get('SSLKEYLOGFILE')
         self._transport.start(
             port=port,

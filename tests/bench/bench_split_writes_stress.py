@@ -207,6 +207,22 @@ async def _run_split_writes(n_streams: int, objs_per_stream: int,
                 transport, "worker_prepare_to_send_calls", -1)
             worker_pulled = getattr(
                 transport, "worker_prepare_to_send_pulled_bytes", -1)
+            # ROOT-CAUSE COUNTERS: receiver-side rx_ring overflow drops.
+            # The receiver is the SERVER side in this test; client and
+            # server share the same _engine in single-process bench.
+            # Pull from the server's TransportContext if accessible.
+            srv_drops = -1
+            srv_drops_data = -1
+            if engine is not None:
+                for pr in engine._protocols.values():
+                    srv_t = getattr(pr, "_transport", None)
+                    if srv_t is not None:
+                        srv_drops = getattr(
+                            srv_t, "worker_rx_event_drops", -1)
+                        srv_drops_data = getattr(
+                            srv_t, "worker_rx_event_drops_stream_data",
+                            -1)
+                        break
     finally:
         server.close()
         await asyncio.sleep(0.05)
@@ -305,6 +321,8 @@ async def _run_split_writes(n_streams: int, objs_per_stream: int,
         "worker_mark_active": worker_mark_active,
         "worker_prepare_calls": worker_prepare,
         "worker_pulled_bytes": worker_pulled,
+        "rx_event_drops": srv_drops,
+        "rx_event_drops_stream_data": srv_drops_data,
         "yield_per_stream": yield_per_stream,
         "pass": streams_complete == n_streams,
     }
@@ -333,6 +351,10 @@ def _print(res):
         f"  worker:      mark_active={res['worker_mark_active']}  "
         f"prepare_calls={res['worker_prepare_calls']}  "
         f"pulled_bytes={res['worker_pulled_bytes']:,}"
+    )
+    print(
+        f"  RX-OVERFLOW: rx_event_drops={res['rx_event_drops']}  "
+        f"of_which_stream_data={res['rx_event_drops_stream_data']}"
     )
     if res['missing_sids_first8']:
         print(

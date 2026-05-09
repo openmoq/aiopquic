@@ -93,6 +93,23 @@ static inline void aiopquic_wt_push_event(
     int ret = spsc_ring_push(s->bridge->rx_ring, &entry, data, data_len);
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
+    } else {
+        /* RX EVENT RING FULL — bytes for WT events live ONLY in
+         * the ring entry (no per-stream fallback), so a drop here
+         * is a hard data loss. Surface via shared counter; log
+         * one-shot under AIOPQUIC_RX_LOG=1. */
+        s->bridge->worker_rx_event_drops++;
+        if (event_type == SPSC_EVT_WT_STREAM_DATA) {
+            s->bridge->worker_rx_event_drops_stream_data++;
+        }
+        if (getenv("AIOPQUIC_RX_LOG")
+                && s->bridge->worker_rx_event_drops <= 100) {
+            fprintf(stderr,
+                "[aiopquic_rx] WT EVENT RING FULL: drop "
+                "stream=%llu evt=%u (rx_ring entries=%u)\n",
+                (unsigned long long)stream_id, event_type,
+                spsc_ring_count(s->bridge->rx_ring));
+        }
     }
 }
 

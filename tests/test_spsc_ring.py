@@ -14,7 +14,10 @@ def test_create_ring():
     """Create a ring buffer with default settings."""
     from aiopquic._binding._transport import RingBuffer
     ring = RingBuffer()
-    assert ring.capacity == 4096
+    # Default mirrors SPSC_RING_DEFAULT_CAPACITY in spsc_ring.h —
+    # sized to absorb sustained multi-Gbps stream-churn bursts
+    # between asyncio drain cycles. Power-of-2 gating is enforced.
+    assert ring.capacity == 262144
     assert ring.count == 0
     assert ring.empty is True
 

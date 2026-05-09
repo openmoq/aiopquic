@@ -82,6 +82,38 @@ typedef struct {
     uint64_t        worker_mark_active_processed;
     uint64_t        worker_prepare_to_send_calls;
     uint64_t        worker_prepare_to_send_pulled_bytes;
+    /* RX-side: count of spsc_ring_push failures on rx_ring (event
+     * ring full). On stream_data callbacks the BYTES were already
+     * pushed to sc->rx; the dropped EVENT means asyncio is not told
+     * those bytes arrived → small streams whose only events drop
+     * are silently lost. THIS WAS THE STREAM-LOSS BUG ROOT CAUSE. */
+    uint64_t        worker_rx_event_drops;
+    uint64_t        worker_rx_event_drops_stream_data;
+    /* Notify-coalescing state. eventfd is level-triggered; multiple
+     * write()s coalesce to one wake-up at the consumer, but each
+     * write is still a syscall. At 250K events/sec on a stream-churn
+     * workload that's a quarter-million unnecessary syscalls/sec on
+     * the picoquic worker thread. Track whether the consumer has
+     * acknowledged the last notify (= drained) and skip the syscall
+     * when there's already a pending notification.
+     *
+     * Set to 1 by aiopquic_notify_rx (worker) on first push since
+     * last drain. Cleared to 0 by aiopquic_clear_rx (consumer) when
+     * it reads the eventfd. Producer-only-sets, single-writer
+     * semantics — atomic exchange used to detect the 0→1 edge. */
+    uint32_t        rx_notify_pending;
+    /* Same coalescing on TX side: skip picoquic_wake_up_network_thread
+     * unless the worker has drained since our last wake. The worker
+     * sets this back to 0 whenever it observes the tx_ring drained
+     * to empty (after popping all entries) so the next producer push
+     * triggers a wake. */
+    uint32_t        tx_wake_pending;
+    /* Per-stream RX byte ring overflow counter. Replaces the
+     * fprintf(stderr,...) on full from the previous diagnostic —
+     * libc stdio holds a global lock and stalls the picoquic worker
+     * under load. Set AIOPQUIC_RX_LOG=1 in the env to re-enable a
+     * one-shot stderr line per overflow event. */
+    uint64_t        worker_rx_byte_ring_overflow;
 } aiopquic_ctx_t;
 
 static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity) {
@@ -142,10 +174,29 @@ static inline void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx) {
     }
 }
 
+/* TX wake-coalescing: producer-side helper. Returns 1 if a wake is
+ * already pending (caller should skip the picoquic_wake_up syscall),
+ * 0 if this caller should write the wake. The worker clears the flag
+ * back to 0 when it finishes draining the TX ring. Single-producer
+ * (asyncio thread) so atomic exchange is sufficient. */
+static inline int aiopquic_tx_wake_set_pending(aiopquic_ctx_t* ctx) {
+    return __atomic_exchange_n(&ctx->tx_wake_pending, 1,
+                                 __ATOMIC_RELEASE);
+}
+
 /* Signal asyncio that there are RX events.
- * Linux: 8-byte counter increment on the eventfd.
- * Other: single byte to the pipe write end. */
+ * Coalesced: write the wake fd only on the 0→1 transition of
+ * rx_notify_pending. The consumer (aiopquic_clear_rx) restores the
+ * flag to 0 after it has drained its ring snapshot AND re-armed if
+ * the ring is still non-empty, so any push that races against the
+ * consumer's drain is guaranteed to wake asyncio at least once.
+ * ACQ_REL pairs with the consumer's RELEASE store on the same flag
+ * and ACQUIRE on the ring entries. */
 static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
+    if (__atomic_exchange_n(&ctx->rx_notify_pending, 1,
+                              __ATOMIC_ACQ_REL) != 0) {
+        return;
+    }
 #ifdef __linux__
     uint64_t val = 1;
     (void)write(ctx->wake_write_fd, &val, sizeof(val));
@@ -155,10 +206,20 @@ static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
 #endif
 }
 
-/* Clear the wake fd after asyncio drains the RX ring.
- * Linux: one read returns and zeros the eventfd counter.
- * Other: drain the pipe until EAGAIN — many notifies coalesce. */
+/* Consumer-side wake-fd clear + re-arm. Caller (drain_rx) MUST have
+ * already drained as many ring entries as it intends to consume in
+ * this cycle BEFORE calling this. We then:
+ *   1. RELEASE-store rx_notify_pending=0 so the NEXT producer push
+ *      will write the wake fd (the producer's exchange sees 0→1).
+ *   2. Drain the wake-fd counter (Linux: one read; other: read until
+ *      EAGAIN).
+ *   3. Re-arm by writing the wake fd if the ring is still non-empty.
+ *      Covers the race where a producer pushed an entry between the
+ *      consumer's peek-empty and pending=0, observing pending=1 and
+ *      thus skipping its own wake write — without re-arm those
+ *      stranded entries would never wake asyncio again. */
 static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
+    __atomic_store_n(&ctx->rx_notify_pending, 0, __ATOMIC_RELEASE);
 #ifdef __linux__
     uint64_t val;
     (void)read(ctx->eventfd, &val, sizeof(val));
@@ -168,6 +229,15 @@ static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
         /* drain */
     }
 #endif
+    if (!spsc_ring_empty(ctx->rx_ring)) {
+#ifdef __linux__
+        uint64_t one = 1;
+        (void)write(ctx->wake_write_fd, &one, sizeof(one));
+#else
+        uint8_t b = 1;
+        (void)write(ctx->wake_write_fd, &b, 1);
+#endif
+    }
 }
 
 /* WT TX-event dispatch hook. Defined in h3wt_callback.h. The loop
@@ -357,13 +427,23 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         uint32_t pushed = aiopquic_stream_buf_push(
             sc->rx, bytes, (uint32_t)length);
         if (pushed != length) {
-            fprintf(stderr,
+            /* Per-stream RX byte-ring overflow. Means the peer sent
+             * more than its advertised flow-control window allowed —
+             * a spec-correct FLOW_CONTROL_ERROR connection close.
+             * Counter incremented from worker thread; opt-in stderr
+             * via env AIOPQUIC_RX_LOG=1 (libc stdio holds a global
+             * lock and stalls the worker thread under load, so the
+             * default is silent). */
+            ctx->worker_rx_byte_ring_overflow++;
+            if (getenv("AIOPQUIC_RX_LOG")) {
+                fprintf(stderr,
                     "[aiopquic_rx] stream=%llu RX ring overflow: "
                     "pushed %u of %zu (free=%u, physical_cap=%u, "
-                    "advertised=%u). True peer flow-control violation.\n",
+                    "advertised=%u). Peer flow-control violation.\n",
                     (unsigned long long)stream_id, pushed, length,
                     aiopquic_stream_buf_free(sc->rx),
                     physical_cap, advertise_cap);
+            }
             return -1;
         }
         if (fin_or_event == picoquic_callback_stream_fin) {
@@ -382,11 +462,27 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     }
     if (ret == 0) {
         aiopquic_notify_rx(ctx);
+    } else {
+        /* RX EVENT RING FULL — the data is already in sc->rx (for
+         * stream_data) but the notification event is gone. asyncio
+         * will only learn about the bytes if a LATER event for the
+         * same stream pushes successfully (drain_rx pops avail bytes
+         * from sc->rx then). Short streams whose only events drop
+         * are silently lost. Counter is exposed via Cython so callers
+         * can detect the condition; opt-in stderr via AIOPQUIC_RX_LOG=1. */
+        ctx->worker_rx_event_drops++;
+        if (has_payload) {
+            ctx->worker_rx_event_drops_stream_data++;
+        }
+        if (getenv("AIOPQUIC_RX_LOG")
+                && ctx->worker_rx_event_drops <= 100) {
+            fprintf(stderr,
+                "[aiopquic_rx] EVENT RING FULL: drop "
+                "stream=%llu evt=%u (rx_ring entries=%u)\n",
+                (unsigned long long)stream_id, entry.event_type,
+                spsc_ring_count(ctx->rx_ring));
+        }
     }
-    /* For non-stream events (datagram, close, ready, etc.) the SPSC
-     * push can still fail under extreme load. Those are control-plane
-     * and rare; if a future deployment hits this we'll move them to a
-     * second priority ring. */
 
     return 0;
 }
@@ -408,6 +504,18 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
             break;
 
         case picoquic_packet_loop_wake_up:
+            /* Clear pending BEFORE draining. Race-safe ordering:
+             * - If producer pushes BEFORE we clear: their exchange
+             *   sees 1, skips wake — but their entry is in the ring,
+             *   we'll see it on the next peek (still in the loop).
+             * - If producer pushes AFTER we clear: their exchange
+             *   sees 0, fires wake — picoquic re-enters this case.
+             * - If producer pushes between our peek-empty and clear:
+             *   their exchange could see 1 (stale) and skip — that's
+             *   why we clear FIRST. Producer always sees 0 when the
+             *   ring was actually drained. */
+            __atomic_store_n(&ctx->tx_wake_pending, 0,
+                              __ATOMIC_RELEASE);
             while (1) {
                 spsc_entry_t* entry = spsc_ring_peek(ctx->tx_ring);
                 if (!entry) break;

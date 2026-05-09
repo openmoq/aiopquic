@@ -28,7 +28,26 @@
 extern "C" {
 #endif
 
-#define SPSC_RING_DEFAULT_CAPACITY  4096    /* entries, must be power of 2 */
+/* Default SPSC ring capacity (entries — must be power of 2).
+ *
+ * Sized for a worst-case burst of stream-related events between
+ * picoquic worker thread pushes and asyncio drain_rx cycles. Each
+ * STREAM_DATA / STREAM_FIN frame received generates one event; the
+ * Python consumer's drain interval (1 asyncio tick) can be on the
+ * order of hundreds of microseconds under load, during which the
+ * picoquic worker can push hundreds of thousands of events at
+ * multi-Gbps line rate with a stream-churn-heavy workload.
+ *
+ * 262144 (256K) entries. At ~64 B per entry that's ~16 MiB per ring.
+ * Empirically required for 1.5–2 Gbps mp-loopback with -g 120 -P 2
+ * -s 1024 (aiomoqt PublishedTrack pattern). Smaller (4096–65536)
+ * caused silent stream-data event drops when consumer idle windows
+ * collided with arrival bursts — the dropped events meant Python
+ * never learned the bytes had arrived in sc->rx, so short streams
+ * whose only notifications fell in the overflow window appeared
+ * lost (entire streams missing from the receiver's stream dict).
+ */
+#define SPSC_RING_DEFAULT_CAPACITY  262144
 #define SPSC_CACHELINE              64
 
 typedef enum {

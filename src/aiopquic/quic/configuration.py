@@ -46,6 +46,20 @@ class QuicConfiguration:
     # is passed verbatim to picoquic_set_default_congestion_algorithm_by_name;
     # an unknown name falls back to the compile-time default.
     congestion_control_algorithm: str | None = None
+    # SPSC TX/RX event ring capacity (entries — must be a power of 2).
+    # Each event is an ~64 B notification between the picoquic worker
+    # thread and the asyncio drain. Sized for the worst-case burst of
+    # stream_data / stream_fin notifications between asyncio drain
+    # cycles. None defers to the compile-time default (262144 — about
+    # 16 MiB per ring). Bump higher for sustained multi-Gbps workloads
+    # with high stream-churn rates (e.g. one stream per video frame
+    # group); lower to reduce memory footprint when stream rate is
+    # low. Below ~16384 entries, multi-Gbps stream-churn workloads
+    # exhibit silent stream-data event drops on the receiver — the
+    # bytes are buffered on the per-stream ring, but the asyncio loop
+    # is never notified about them, so short streams whose only
+    # notifications fall in the overflow window are silently lost.
+    event_ring_capacity: int | None = None
 
     def load_cert_chain(self, certfile: str, keyfile: str | None = None,
                         password: str | None = None) -> None:
