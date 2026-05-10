@@ -166,6 +166,7 @@ class QuicConnection:
             keylog_filename=keylog,
             rx_ring_cap=cfg.max_stream_data,
             congestion_control_algorithm=cfg.congestion_control_algorithm,
+            initial_max_data=cfg.max_data,
         )
 
     def connect(self, addr: tuple[str, int], now: float = 0.0) -> None:
@@ -515,6 +516,7 @@ class QuicEngine:
             keylog_filename=keylog,
             rx_ring_cap=cfg.max_stream_data,
             congestion_control_algorithm=cfg.congestion_control_algorithm,
+            initial_max_data=cfg.max_data,
         )
 
     @property

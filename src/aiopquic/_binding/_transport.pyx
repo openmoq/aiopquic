@@ -834,7 +834,8 @@ cdef class TransportContext:
               alpn=None, bint is_client=True, uint64_t idle_timeout_ms=30000,
               uint32_t max_datagram_frame_size=0,
               wt_path=None, debug_log=None, keylog_filename=None,
-              uint32_t rx_ring_cap=0, congestion_control_algorithm=None):
+              uint32_t rx_ring_cap=0, congestion_control_algorithm=None,
+              uint64_t initial_max_data=0):
         """
         Create the picoquic context and start the network thread.
 
@@ -964,7 +965,8 @@ cdef class TransportContext:
         # peer-allowed in-flight ≤ our RX ring capacity.
         cdef picoquic_tp_t tp
         cdef const picoquic_tp_t* cur_tp
-        if max_datagram_frame_size > 0 or rx_ring_cap > 0:
+        if (max_datagram_frame_size > 0 or rx_ring_cap > 0
+                or initial_max_data > 0):
             cur_tp = picoquic_get_default_tp(self._quic)
             if cur_tp != NULL:
                 tp = cur_tp[0]
@@ -974,6 +976,14 @@ cdef class TransportContext:
                     tp.initial_max_stream_data_bidi_local = rx_ring_cap
                     tp.initial_max_stream_data_bidi_remote = rx_ring_cap
                     tp.initial_max_stream_data_uni = rx_ring_cap
+                if initial_max_data > 0:
+                    # Connection-level flow control. picoquic's default
+                    # is 1 MiB which falls over hard on MP-loopback at
+                    # multi-stream workloads — every 1 MiB of TX data
+                    # forces a MAX_DATA roundtrip, capping throughput
+                    # at ~1 MiB / RTT. Pass cfg.max_data here to size
+                    # the connection window for sustained workloads.
+                    tp.initial_max_data = initial_max_data
                 picoquic_set_default_tp(self._quic, &tp)
 
         # Configure packet loop parameters (must persist — picoquic stores a pointer)

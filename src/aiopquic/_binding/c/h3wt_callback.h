@@ -175,12 +175,20 @@ static int aiopquic_wt_path_callback(
             }
         } else {
             /* First data on a peer-opened stream: announce it before
-             * delivering payload. h3zero increments post_received only
-             * after this callback returns, so post_received == 0 is a
-             * clean first-touch marker. */
+             * delivering payload. picoquic's h3zero only auto-increments
+             * post_received for POST-method requests (see
+             * h3zero_common.c:1350: `if (is_post)`), NOT for WT path
+             * callbacks — so post_received stays 0 on every chunk
+             * unless we set it ourselves. We own this field as a
+             * first-touch sentinel for the WT layer; without this
+             * the receiver would emit WT_NEW_STREAM on every post_data
+             * callback (~104 events per real stream at 60 objs/stream
+             * in bench_wt_split_writes_stress), spawning racing
+             * collectors that truncate streams. */
             if (stream_ctx->post_received == 0) {
                 aiopquic_wt_push_event(s, SPSC_EVT_WT_NEW_STREAM,
                                         sid, 0, NULL, 0);
+                stream_ctx->post_received = 1;
             }
             aiopquic_wt_push_event(s, SPSC_EVT_WT_STREAM_DATA,
                                     sid, 0, bytes, (uint32_t)length);
@@ -200,9 +208,12 @@ static int aiopquic_wt_path_callback(
                                     s->control_stream_id, 0, NULL, 0);
             s->session_closing = 1;
         } else {
+            /* See post_data branch comment: we own post_received for
+             * WT streams as a first-touch sentinel. */
             if (stream_ctx->post_received == 0) {
                 aiopquic_wt_push_event(s, SPSC_EVT_WT_NEW_STREAM,
                                         sid, 0, NULL, 0);
+                stream_ctx->post_received = 1;
             }
             if (length > 0) {
                 aiopquic_wt_push_event(s, SPSC_EVT_WT_STREAM_DATA,
