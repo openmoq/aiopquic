@@ -236,6 +236,34 @@ static inline int spsc_ring_push(spsc_ring_t* ring, const spsc_entry_t* entry,
 }
 
 /*
+ * Push with a BORROWED data_buf pointer (no malloc, no memcpy). The
+ * caller-supplied entry.data_buf is preserved as-is in the ring slot.
+ * Used by Phase B WT path where the entry carries a pointer to a
+ * per-stream aiopquic_stream_ctx_t whose lifetime exceeds the ring
+ * entry's. Consumer MUST NOT call spsc_ring_pop without first zeroing
+ * the borrowed pointer, OR data_length must be 0 (the convention spsc_
+ * ring_pop honors: only free when data_length > 0).
+ */
+static inline int spsc_ring_push_borrowed(spsc_ring_t* ring,
+                                           const spsc_entry_t* entry) {
+    uint64_t tail = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+    uint64_t head = atomic_load_explicit(&ring->head, memory_order_acquire);
+
+    if (tail - head >= ring->capacity) {
+        return -1;
+    }
+
+    uint32_t slot = (uint32_t)(tail & ring->mask);
+    spsc_entry_t* e = &ring->entries[slot];
+    *e = *entry;
+    /* data_buf is preserved from entry; data_length must be 0 to
+     * signal "borrowed pointer; do not free on pop" (see _pop). */
+
+    atomic_store_explicit(&ring->tail, tail + 1, memory_order_release);
+    return 0;
+}
+
+/*
  * Peek at the next entry to read (CONSUMER only). Pointer remains
  * stable until spsc_ring_pop() is called.
  */
@@ -270,9 +298,12 @@ static inline const uint8_t* spsc_ring_entry_data(spsc_ring_t* ring,
 static inline void spsc_ring_pop(spsc_ring_t* ring) {
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
     spsc_entry_t* e = &ring->entries[head & ring->mask];
-    /* Default: free any leftover data_buf. Consumers transferring
-     * ownership must NULL the buffer pointer before calling pop. */
-    if (e->data_buf) {
+    /* Free only when the buffer was malloc'd by spsc_ring_push (which
+     * sets data_length > 0). Phase B WT borrowed pointers carry
+     * data_length=0 — the per-stream aiopquic_stream_ctx_t in
+     * data_buf is owned by the WT session, not the ring entry, and
+     * must outlive the entry. */
+    if (e->data_buf && e->data_length > 0) {
         free(e->data_buf);
         e->data_buf = NULL;
     }

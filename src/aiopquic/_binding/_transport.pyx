@@ -30,6 +30,7 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_CLOSE, SPSC_EVT_APP_CLOSE,
     SPSC_EVT_READY, SPSC_EVT_ALMOST_READY,
     SPSC_EVT_DATAGRAM,
+    SPSC_EVT_WT_STREAM_DATA, SPSC_EVT_WT_STREAM_FIN,
     SPSC_EVT_TX_STREAM_DATA, SPSC_EVT_TX_STREAM_FIN,
     SPSC_EVT_TX_DATAGRAM, SPSC_EVT_TX_CLOSE,
     SPSC_EVT_TX_MARK_ACTIVE, SPSC_EVT_TX_CONNECT,
@@ -626,6 +627,31 @@ cdef class TransportContext:
                             # in its next stream_data callback to decide
                             # when to extend MAX_STREAM_DATA. No SPSC
                             # dispatch, no wake_up, no thread crossing.
+                            aiopquic_stream_ctx_rx_consumed_add(
+                                sc, <uint64_t>length)
+            elif (entry.event_type == SPSC_EVT_WT_STREAM_DATA or
+                  entry.event_type == SPSC_EVT_WT_STREAM_FIN) and \
+                  entry.data_buf is not NULL and entry.data_length == 0:
+                # Phase B WT RX path: data_buf is a borrowed pointer to
+                # the per-stream aiopquic_stream_ctx_t owned by the WT
+                # session (entry.stream_ctx is the session itself, used
+                # by the asyncio dispatcher for routing). Bytes live in
+                # sc->rx; pop and return them as a memoryview so the
+                # caller sees the same `data` shape as the legacy inline
+                # path. data_length=0 keeps spsc_ring_pop from freeing
+                # the borrowed pointer.
+                sc = <aiopquic_stream_ctx_t*>entry.data_buf
+                rx_sb = sc.rx
+                if rx_sb is not NULL:
+                    avail = aiopquic_stream_buf_used(rx_sb)
+                    if avail > 0:
+                        length = avail
+                        buf = malloc(<size_t>length)
+                        if buf is not NULL:
+                            aiopquic_stream_buf_pop(
+                                rx_sb, <uint8_t*>buf, <uint32_t>length)
+                            data = memoryview(
+                                StreamChunk._wrap(buf, length))
                             aiopquic_stream_ctx_rx_consumed_add(
                                 sc, <uint64_t>length)
 

@@ -37,6 +37,11 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_TX_OPEN_FLOW_CONTROL
         SPSC_EVT_TX_SET_APP_FLOW_CONTROL
         SPSC_EVT_WT_NEW_SESSION
+        SPSC_EVT_WT_STREAM_DATA
+        SPSC_EVT_WT_STREAM_FIN
+        SPSC_EVT_WT_STREAM_RESET
+        SPSC_EVT_WT_STOP_SENDING
+        SPSC_EVT_WT_NEW_STREAM
 
     ctypedef struct spsc_entry_t:
         uint64_t    stream_id
