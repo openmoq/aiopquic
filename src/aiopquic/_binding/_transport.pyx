@@ -655,6 +655,19 @@ cdef class TransportContext:
                             aiopquic_stream_ctx_rx_consumed_add(
                                 sc, <uint64_t>length)
 
+            # Cython-side coalescing: when the picoquic worker fires
+            # multiple stream_data callbacks for the same stream
+            # rapidly, each pushes an SPSC event but the FIRST drain
+            # pops all of sc->rx. Subsequent events for that stream
+            # carry data=None — pure dispatch waste. Skip them. FIN
+            # events still emit since they signal end-of-stream
+            # regardless of data presence.
+            if (data is None and
+                (entry.event_type == SPSC_EVT_STREAM_DATA or
+                 entry.event_type == SPSC_EVT_WT_STREAM_DATA)):
+                spsc_ring_pop(self._ctx.rx_ring)
+                continue
+
             events.append((
                 entry.event_type,
                 entry.stream_id,
