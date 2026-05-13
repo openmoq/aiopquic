@@ -32,13 +32,23 @@ extern "C" {
 
 /*
  * Packed payload for SPSC_EVT_TX_WT_OPEN. Stored as data_buf:
- * header + sni + path. ALPN is always "h3" for WT, not carried.
+ *   header + sni + path + protocols.
+ *
+ * ALPN is always "h3" for WT, not carried.
+ *
+ * protocols is an OPTIONAL comma-separated list of subprotocol
+ * identifiers to advertise in the WT-Available-Protocols header
+ * (per WebTransport HTTP/3 spec §3.3). aiopquic treats it as an
+ * opaque string — no interpretation; passed verbatim to
+ * picowt_connect. Empty (protocols_len == 0) sends no header.
  */
 typedef struct {
     struct sockaddr_in addr;
     uint16_t sni_len;
     uint16_t path_len;
-    /* followed by: sni_len bytes of SNI, then path_len bytes of path */
+    uint16_t protocols_len;
+    /* followed by: sni_len bytes of SNI, then path_len bytes of path,
+     * then protocols_len bytes of protocols. */
 } aiopquic_wt_open_params_t;
 
 /*
@@ -764,6 +774,8 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
             (const aiopquic_wt_open_params_t*)raw;
         char sni_buf[256];
         char path_buf[1024];
+        char protocols_buf[256];
+        const char* protocols_arg = NULL;
         size_t offset = sizeof(aiopquic_wt_open_params_t);
 
         if (p->sni_len == 0 || p->sni_len >= sizeof(sni_buf) ||
@@ -784,6 +796,19 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         }
         memcpy(path_buf, raw + offset, p->path_len);
         path_buf[p->path_len] = '\0';
+        offset += p->path_len;
+
+        /* Optional WT-Available-Protocols subprotocol list. Empty
+         * (protocols_len == 0) passes NULL to picowt_connect — no
+         * header on the wire. Overflow or truncation also yields
+         * NULL to fail safe rather than send a malformed header. */
+        if (p->protocols_len > 0
+                && p->protocols_len < sizeof(protocols_buf)
+                && offset + p->protocols_len <= entry->data_length) {
+            memcpy(protocols_buf, raw + offset, p->protocols_len);
+            protocols_buf[p->protocols_len] = '\0';
+            protocols_arg = protocols_buf;
+        }
 
         picoquic_cnx_t* cnx = NULL;
         h3zero_callback_ctx_t* h3_ctx = NULL;
@@ -807,7 +832,7 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         rc = picowt_connect(cnx, h3_ctx, control_stream,
                               sni_buf, path_buf,
                               aiopquic_wt_path_callback,
-                              (void*)s, NULL);
+                              (void*)s, protocols_arg);
         if (rc == 0) {
             /* picowt_prepare_client_cnx + picowt_connect leave the
              * cnx inert; pull the trigger so picoquic kicks off the

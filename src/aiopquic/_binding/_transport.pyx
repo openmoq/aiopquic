@@ -1167,6 +1167,7 @@ cdef extern from "c/h3wt_callback.h":
         sockaddr_in addr
         uint16_t sni_len
         uint16_t path_len
+        uint16_t protocols_len
 
 
 cdef class WebTransportSessionState:
@@ -1244,9 +1245,15 @@ cdef class WebTransportSessionState:
             return 0
         return self._wt.control_stream_id
 
-    def push_open(self, str host, int port, str path, str sni):
+    def push_open(self, str host, int port, str path, str sni,
+                  str wt_protocols=""):
         """Push TX_WT_OPEN to the picoquic thread. Build the params
-        payload (addr + sni + path), then push entry."""
+        payload (addr + sni + path + protocols), then push entry.
+
+        wt_protocols is a comma-separated string of WT-Available-Protocols
+        subprotocol identifiers (empty string = none, send NULL on wire).
+        aiopquic does no interpretation; verbatim handed to picoquic.
+        """
         cdef sockaddr_in addr
         memset(&addr, 0, sizeof(addr))
         addr.sin_family = AF_INET
@@ -1258,22 +1265,27 @@ cdef class WebTransportSessionState:
         cdef bytes b_sni = sni.encode()
         # Empty client path → "/" (HTTP/3 root, RFC 9114 §4.3.1).
         cdef bytes b_path = b"/" if path == "" else path.encode()
+        cdef bytes b_protocols = wt_protocols.encode()
         cdef uint32_t sni_len = <uint32_t>len(b_sni)
         cdef uint32_t path_len = <uint32_t>len(b_path)
+        cdef uint32_t protocols_len = <uint32_t>len(b_protocols)
         cdef uint32_t hdr_size = sizeof(aiopquic_wt_open_params_t)
-        cdef uint32_t total = hdr_size + sni_len + path_len
+        cdef uint32_t total = hdr_size + sni_len + path_len + protocols_len
 
         cdef bytearray buf = bytearray(total)
         cdef uint8_t* p = <uint8_t*><char*>buf
-        # Layout: addr | sni_len(2) | path_len(2) | sni | path
+        # Layout: addr | sni_len(2) | path_len(2) | protocols_len(2)
+        #       | sni | path | protocols
         memcpy(p, &addr, sizeof(sockaddr_in))
-        # sni_len + path_len native-uint16; aiopquic_wt_open_params_t
-        # struct on the C side uses host byte order for these fields.
         cdef uint16_t* hdr_lens = <uint16_t*>(p + sizeof(sockaddr_in))
         hdr_lens[0] = <uint16_t>sni_len
         hdr_lens[1] = <uint16_t>path_len
+        hdr_lens[2] = <uint16_t>protocols_len
         memcpy(p + hdr_size, <const uint8_t*>b_sni, sni_len)
         memcpy(p + hdr_size + sni_len, <const uint8_t*>b_path, path_len)
+        if protocols_len > 0:
+            memcpy(p + hdr_size + sni_len + path_len,
+                   <const uint8_t*>b_protocols, protocols_len)
 
         cdef spsc_entry_t entry
         memset(&entry, 0, sizeof(entry))

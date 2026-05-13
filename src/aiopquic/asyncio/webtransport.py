@@ -336,12 +336,18 @@ class WebTransportClient(WebTransportSession):
 
     def __init__(self, transport: TransportContext,
                  host: str, port: int, path: str,
-                 sni: str | None = None):
+                 sni: str | None = None,
+                 wt_available_protocols: list[str] | None = None):
         super().__init__(transport, role="client")
         self._host = host
         self._port = port
         self._path = path
         self._sni = sni or host
+        # WT-Available-Protocols header sent in the H3 CONNECT request
+        # (WebTransport spec §3.3). Generic list of subprotocol strings;
+        # aiopquic does no interpretation. Higher layers (e.g. aiomoqt)
+        # set this to advertise their version namespace (moqt-NN etc.).
+        self._wt_protocols = wt_available_protocols or []
 
     async def open(self, timeout: float = 10.0) -> None:
         """Initiate the WT session — push TX_WT_OPEN, await
@@ -352,7 +358,17 @@ class WebTransportClient(WebTransportSession):
         self._session_ready = self._loop.create_future()
 
         addr = _resolve_host(self._host)
-        self._state.push_open(addr, self._port, self._path, self._sni)
+        # WT-Available-Protocols is an HTTP Structured Field list of
+        # strings (RFC 9651); each value is double-quoted, comma-joined.
+        # picoquic puts the value into the QPACK literal verbatim — no
+        # SF formatting on its side — so we have to produce the
+        # canonical form here.
+        if self._wt_protocols:
+            protocols_str = ", ".join(f'"{p}"' for p in self._wt_protocols)
+        else:
+            protocols_str = ""
+        self._state.push_open(addr, self._port, self._path, self._sni,
+                              protocols_str)
 
         try:
             await asyncio.wait_for(self._session_ready, timeout=timeout)
@@ -513,6 +529,7 @@ def _get_dispatcher_registry() -> _DispatcherRegistry:
 async def connect_webtransport(
         host: str, port: int, path: str,
         *, sni: str | None = None,
+        wt_available_protocols: list[str] | None = None,
         transport: TransportContext | None = None,
         timeout: float = 10.0,
 ) -> AsyncGenerator[WebTransportClient, None]:
@@ -542,7 +559,8 @@ async def connect_webtransport(
         transport.start(is_client=True, alpn="h3",
                           max_datagram_frame_size=64 * 1024)
 
-    client = WebTransportClient(transport, host, port, path, sni=sni)
+    client = WebTransportClient(transport, host, port, path, sni=sni,
+                                  wt_available_protocols=wt_available_protocols)
     try:
         await client.open(timeout=timeout)
         yield client
