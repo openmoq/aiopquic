@@ -36,6 +36,17 @@ jobs:
           echo "error: version must be N.N.N, got '$VERSION'" >&2
           exit 1
         fi
+        # Hard gate: pyproject.toml `version` must match the workflow
+        # input. Without this, the build produced wheels with the OLD
+        # version string (from pyproject) which then collided with an
+        # already-published file on TestPyPI — caught only on upload,
+        # after tag + test + build all succeeded. Fail loud, here.
+        PYPROJECT_VERSION=$(awk -F'"' '/^version *= *"/{print $2; exit}' pyproject.toml)
+        if [ "$VERSION" != "$PYPROJECT_VERSION" ]; then
+          echo "error: pyproject.toml version '$PYPROJECT_VERSION' does not match input '$VERSION'" >&2
+          echo "       bump pyproject.toml first, commit + push, then re-dispatch." >&2
+          exit 1
+        fi
         TAG="v$VERSION"
         if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
           echo "error: tag '$TAG' already exists" >&2
