@@ -642,6 +642,22 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                     continue;
                 }
 
+                /* WT events route through aiopquic_wt_handle_tx, which
+                 * interprets entry->cnx as aiopquic_wt_session_t* — NOT a
+                 * picoquic_cnx_t*. TX_WT_OPEN in particular CREATES the
+                 * picoquic cnx (via picowt_prepare_client_cnx) and stashes
+                 * it into wt_session->cnx. The raw-QUIC liveness guard
+                 * below must not be applied to these: walking picoquic's
+                 * live-cnx list with a wt_session pointer always misses
+                 * and drops the event. WT sessions track their own
+                 * lifecycle inside aiopquic_wt_handle_tx. */
+                if (entry->event_type >= SPSC_EVT_TX_WT_OPEN &&
+                    entry->event_type <= SPSC_EVT_TX_WT_STOP_SENDING) {
+                    (void)aiopquic_wt_handle_tx(quic, ctx, entry);
+                    spsc_ring_pop(ctx->tx_ring);
+                    continue;
+                }
+
                 /* Stale-cnx guard. Drops events whose cnx was freed
                  * between the Python push and this pop. Without this,
                  * any picoquic_* call below UAFs. See
