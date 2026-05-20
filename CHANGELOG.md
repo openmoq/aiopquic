@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.4 (unreleased)
+## v0.3.4 (2026-05-19)
 
 ### TX stale-cnx UAF guard
 
