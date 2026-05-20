@@ -74,22 +74,10 @@ jobs:
         ref: v${{ needs.tag.outputs.version }}
         submodules: recursive
         fetch-depth: 0
-    - name: Set up Python 3.14
-      uses: actions/setup-python@v5
-      with:
-        python-version: "3.14"
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y cmake libssl-dev
-    - name: Build picoquic
-      run: ./build_picoquic.sh
-    - name: Install + test
+    - uses: ./.github/actions/setup-aiopquic
+    - name: Run test gate
       timeout-minutes: 15
-      run: |
-        python -m pip install --upgrade pip
-        pip install -e '.[dev]'
-        python -m pytest tests/ -v -m "not interop and not native"
+      run: python -m pytest tests/ -v -m "not interop and not native"
 
   build-sdist:
     needs: [tag, test]
