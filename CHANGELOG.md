@@ -1,5 +1,88 @@
 # Changelog
 
+## v0.3.4 (2026-05-19)
+
+### TX stale-cnx UAF guard
+
+The peer's `CLOSE_CONNECTION` (or app-side close, or timeout) can
+free a `picoquic_cnx_t*` between Python's `push_tx` and the C
+worker's SPSC pop. The previous `if (!cnx)` guard only caught
+explicit NULL — not a stale-but-non-NULL pointer to freed memory.
+
+Surfaced as `picoquic_create_stream` NULL-page faults on macOS at
+multi-stream small-object unbounded-rate publishes. Same shape as
+the `TX_CLOSE` UAF fixed in 0.3.2, but in the other TX_* handlers
+(`MARK_ACTIVE`, `STREAM_DATA`, `STREAM_FIN`, `DATAGRAM`,
+`STREAM_RESET`, `STOP_SENDING`, `OPEN_FLOW_CONTROL`,
+`SET_APP_FLOW_CONTROL`).
+
+Fix: factor the live-cnx-list walk that 0.3.2 added inline for
+`TX_CLOSE` into a `static inline aiopquic_cnx_is_alive()` helper.
+Apply the helper at the TX dispatch entry — every TX_* handler is
+now UAF-safe. The `TX_CLOSE` case loses its duplicate inline walk.
+
+Walk cost: O(N_cnx) per TX event. For aiomoqt's current publisher /
+client shape (1–2 cnxs) it's a few pointer compares per event —
+effectively free. Marked TODO for replacement with a generation
+counter (O(1)) if a many-cnx relay role emerges.
+
+WT events (SPSC IDs 136–142) bypass the new guard via a short-circuit
+at the dispatch entry. Their `entry->cnx` is an
+`aiopquic_wt_session_t*`, not a `picoquic_cnx_t*`; for `TX_WT_OPEN`
+specifically the picoquic cnx doesn't exist yet (it's created inside
+`picowt_prepare_client_cnx`). Walking picoquic's live-cnx list with a
+wt_session pointer always misses and dropped every WT TX event,
+timing out WT CONNECT at 10 s. WT sessions own their own lifecycle
+in `aiopquic_wt_handle_tx`.
+
+### `QuicConnection.send_stream_data_drained()` — async send with built-in backpressure
+
+New high-level method that bundles ring-saturation wait + soft post-
+send yield around `send_stream_data`. The "obvious correct way" to
+send from an async producer loop:
+
+```python
+await quic.send_stream_data_drained(stream_id, data, end_stream=False)
+```
+
+Composes the existing primitives (`tx_pressure`, `get_tx_drain_event`,
+`send_stream_data`) so any caller using this gets worker-thread-aware
+pacing without copying the heuristic. Behavior layered into one
+coroutine:
+
+- **Hard ring guard**: `tx_pressure > hard_wait_at` (default 0.9)
+  awaits the SPSC drain event before queuing.
+- **Send**: atomic `send_stream_data` (push + MARK_ACTIVE + worker
+  wake under one GIL hold; all-or-nothing on BufferError).
+- **Soft yield**: after a successful send, `tx_pressure > soft_yield_at`
+  (default 0.5) does `await asyncio.sleep(0)` so the worker thread
+  sees the GIL. Avoids the count-based heuristic that starved the
+  worker on fast Python paths (notably Linux + UDP GSO).
+- **BufferError retry**: ring went full between the pressure check
+  and the send — await drain, retry the same buffer.
+
+Application-level policies (byte budgets, fairness across streams,
+etc.) belong above this layer. aiomoqt 0.9.5's `MOQTSession.
+stream_write_drain` shrinks accordingly: only the bytes-aware
+producer-budget policy stays in MOQT land; the transport-level wait/
+yield mechanics move down here.
+
+Raw-QUIC only in this release. The WT data-stream send path still
+uses the older push model (`push_stream_data` → `TX_STREAM_DATA` with
+inline payload → `picoquic_add_to_stream`), so it has no per-stream
+`sc->tx` byte ring and no edge-trigger drain event. `WebTransportSession`
+therefore doesn't expose `get_tx_drain_event` / `tx_pressure` and the
+WT path keeps the existing polling-sleep fallback.
+
+Deferred architectural follow-up: migrate WT data streams to the
+pull model (per-WT-stream `sc->tx` + `tx_send_atomic` + MARK_ACTIVE
++ `prepare_to_send`). That gives WT real per-stream backpressure —
+essential because publishers commonly multiplex streams with very
+different object sizes and pacing profiles, where a per-session
+waker would be a half-measure. The data streams are real QUIC streams
+under picowt; the divergence is implementation history, not a picowt
+constraint.
+
 ## v0.3.3 (2026-05-18)
 
 Pairs with [aiomoqt 0.9.5](https://pypi.org/project/aiomoqt/0.9.5/).

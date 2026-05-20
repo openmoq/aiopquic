@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aiopquic"
-version = "0.3.3"
+version = "0.3.4"
 description = "High-performance QUIC/HTTP3 library — picoquic-backed, qh3-compatible asyncio API"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -80,6 +80,7 @@ test-command = "python -c 'import aiopquic; from aiopquic._binding import _trans
 # Trade-off: manylinux_2_34 narrows wheel compatibility to glibc
 # 2.34+ (RHEL 9 / Ubuntu 22.04+); older systems install via sdist.
 manylinux-x86_64-image = "manylinux_2_34"
+manylinux-aarch64-image = "manylinux_2_34"
 before-all = """
 dnf install -y openssl-devel cmake
 bash build_picoquic.sh

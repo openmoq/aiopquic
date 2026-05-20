@@ -1,0 +1,91 @@
+name: 'Set up aiopquic build env'
+description: >
+  Set up Python, system dependencies, picoquic build cache, and install
+  aiopquic in editable mode with the requested extras. Centralizes the
+  env-setup dance every aiopquic CI job repeats: submodule SHA capture,
+  platform-conditional system deps (cmake + openssl), picoquic build
+  cache keyed on submodule HEADs + patches, conditional picoquic build,
+  and editable pip install.
+
+  IMPORTANT: callers must run actions/checkout with `submodules: recursive`
+  and `fetch-depth: 0` before invoking this action — checkout itself
+  cannot be inside a composite.
+
+inputs:
+  python-version:
+    description: 'Python version to install (e.g. "3.14", "3.13", "3.12")'
+    required: false
+    default: '3.14'
+  extras:
+    description: >
+      Pip install extras key (e.g. "dev" → installs ".[dev]").
+      Use "" to install with no extras.
+    required: false
+    default: 'dev'
+  with-native-tests:
+    description: >
+      If "true", also runs build_picoquic_tests.sh after the main build
+      (for the native test-driver tier). Uses a separate cache key so
+      a tests-included build doesn't poison the cache for jobs that
+      don't need them.
+    required: false
+    default: 'false'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Capture submodule SHAs for cache key
+      id: shas
+      shell: bash
+      run: |
+        pico=$(cd third_party/picoquic && git rev-parse HEAD)
+        ptls=$(cd third_party/picotls && git rev-parse HEAD)
+        echo "pico=$pico" >> "$GITHUB_OUTPUT"
+        echo "ptls=$ptls" >> "$GITHUB_OUTPUT"
+    - name: Set up Python ${{ inputs.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+        cache: 'pip'
+        cache-dependency-path: 'pyproject.toml'
+    - name: Install system dependencies (Linux)
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y cmake libssl-dev
+    - name: Install system dependencies (macOS)
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        # cmake + openssl@3 are usually preinstalled on macos-latest
+        # runners; idempotent install for hardness.
+        brew list cmake >/dev/null 2>&1 || brew install cmake
+        brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+    - name: Cache picoquic build
+      id: picoquic-cache
+      uses: actions/cache@v4
+      with:
+        path: third_party/picoquic/build
+        key: picoquic-build${{ inputs.with-native-tests == 'true' && '-native' || '' }}-${{ runner.os }}-${{ steps.shas.outputs.pico }}-${{ steps.shas.outputs.ptls }}-${{ hashFiles('build_picoquic.sh', 'patches/*.patch', 'build_picoquic_tests.sh') }}
+    - name: Build picoquic
+      if: steps.picoquic-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        ./build_picoquic.sh
+        if [ "${{ inputs.with-native-tests }}" = "true" ]; then
+          if [ -x ./build_picoquic_tests.sh ]; then
+            ./build_picoquic_tests.sh
+          else
+            echo "::warning::build_picoquic_tests.sh not present; skipping native test driver build"
+          fi
+        fi
+    - name: Install aiopquic (editable)
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip
+        if [ -n "${{ inputs.extras }}" ]; then
+          pip install -e ".[${{ inputs.extras }}]"
+        else
+          pip install -e .
+        fi
