@@ -67,6 +67,14 @@ typedef enum {
     SPSC_EVT_PATH_DELETED = 13,
     SPSC_EVT_PACING_CHANGED = 14,
     SPSC_EVT_STREAM_TX_DRAINED = 15,    /* edge: sc->tx had a waiter and worker just drained */
+    SPSC_EVT_TX_RING_DRAINED = 16,      /* edge: connection-global TX event ring
+                                           fill dropped below low_water while a
+                                           Python writer had armed
+                                           tx_ring_drain_pending. Fired by worker
+                                           CAS-clear pattern, mirrors the per-
+                                           stream STREAM_TX_DRAINED design but
+                                           tracks the SPSC ring count, not
+                                           per-sc byte ring fullness. */
 
     SPSC_EVT_TX_STREAM_DATA = 128,
     SPSC_EVT_TX_STREAM_FIN = 129,
@@ -120,6 +128,16 @@ typedef enum {
                                               created. data = path bytes;
                                               cnx = picoquic_cnx_t*;
                                               stream_ctx = aiopquic_wt_session_t* */
+    SPSC_EVT_WT_STREAM_LINK_RELEASE = 76,  /* Cython-internal: pushed by
+                                              picohttp_callback_free as the
+                                              LAST event for a stream so the
+                                              SPSC ring's FIFO ordering
+                                              ensures Python drains all
+                                              pending STREAM_DATA/FIN/RESET
+                                              for this stream before drain_rx
+                                              calls aiopquic_wt_stream_link_destroy.
+                                              data_buf = link*; not exposed
+                                              to Python. */
 } spsc_event_type_t;
 
 typedef struct {

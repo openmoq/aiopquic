@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.5 (unreleased)
+
+### Build
+
+- Vendored `third_party/liburing` submodule pinned at `liburing-2.7`. Auto-fetched and built static-only when `AIOPQUIC_IO_URING=1`; otherwise inert (no fetch, no link).
+- New `AIOPQUIC_PERF=1` env switch in `build_picoquic.sh` enables portable host-tuned optimizations (Fusion AES-GCM on x86_64, `DISABLE_DEBUG_PRINTF`, `-O3 -march=native -flto`). Default OFF; never enabled in PyPI wheels (machine-specific).
+- New `AIOPQUIC_IO_URING=1` env switch (EXPERIMENTAL / DORMANT). Builds `picoquic_packet_loop_uring` into `libpicoquic-core.a` and statically links liburing into the Cython extension. **No runtime effect today** — aiopquic's worker thread does not invoke the io_uring packet loop. Scaffolding preserved for future worker migration. Linux-only; hard-errors on macOS / BSD / Windows. ABI footgun documented in README and propagated automatically via setup.py (`PICOQUIC_WITH_IO_URING` define mirrored to picoquic-core build and Cython compile to keep `picoquic_network_thread_ctx_t` / `picoquic_socket_ctx_t` layouts aligned).
+- New picoquic patch `patches/0002-picoquic-sockloop-drop-system-io_uring-header.patch` removes `#include <linux/io_uring.h>` from `sockloop.c`; liburing's bundled header provides the same superset, and the system uapi on older distros (e.g. Ubuntu 22.04's 5.15 LTS) conflicts via shared `LINUX_IO_URING_H` include guard. Patch is dead code when `WITH_IO_URING=OFF`.
+
 ## v0.3.4 (2026-05-19)
 
 ### TX stale-cnx UAF guard

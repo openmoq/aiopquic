@@ -25,7 +25,7 @@
  * max_stream_data hasn't been threaded through (e.g., raw transport
  * tests bypassing QuicConfiguration). Production code paths use the
  * configured window via aiopquic_ctx_t.rx_ring_cap. Power of two. */
-#define AIOPQUIC_RX_RING_CAP_DEFAULT (1u << 20)
+#define AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT (1u << 20)
 
 /* MAX_STREAM_DATA hysteresis: advance peer credit when ≥ 1/4 of the
  * ring has been drained since the last update. Matches picoquic's
@@ -478,7 +478,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
          * spec-correct FLOW_CONTROL_ERROR connection close. */
         uint32_t advertise_cap = ctx->rx_ring_cap > 0
             ? ctx->rx_ring_cap
-            : AIOPQUIC_RX_RING_CAP_DEFAULT;
+            : AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT;
         uint32_t physical_cap = advertise_cap;
         uint32_t fc_threshold = advertise_cap / AIOPQUIC_RX_FC_THRESHOLD_DIV;
         aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)stream_ctx;

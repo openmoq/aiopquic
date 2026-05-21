@@ -162,6 +162,40 @@ python -m pytest tests/ -v -m "not interop and not native"
 python -m pytest tests/bench
 ```
 
+## Performance build (opt-in)
+
+Default builds use `CMAKE_BUILD_TYPE=Release` (`-O3 -DNDEBUG`), portable across hosts. Two opt-in env vars layer on host-tuned optimizations for local benching — neither is enabled in PyPI wheels:
+
+```bash
+# Host-tuned: Fusion AES-GCM (x86_64), DISABLE_DEBUG_PRINTF,
+# -O3 -march=native -flto. Binary becomes machine-specific.
+AIOPQUIC_PERF=1 ./build_picoquic.sh
+```
+
+Per-platform behavior:
+
+| Knob                          | Linux x86_64 | Linux ARM64 | macOS arm64 | macOS x86_64 |
+|-------------------------------|:------------:|:-----------:|:-----------:|:------------:|
+| `-O3 -DNDEBUG` (always on)    |      ✓       |      ✓      |      ✓      |      ✓       |
+| `DISABLE_DEBUG_PRINTF`        |      ✓       |      ✓      |      ✓      |      ✓       |
+| Fusion AES-GCM (CPUID-dispatched) | ✓        |      –      |      –      |      ✓       |
+| `-march=native` / `-mcpu=native` + `-flto` | ✓ | ✓     |      ✓      |      ✓       |
+
+### Experimental: `AIOPQUIC_IO_URING=1` (DORMANT)
+
+io_uring scaffolding is in the tree (`third_party/liburing` submodule, picoquic patch, setup.py linkage). Enabling it builds `picoquic_packet_loop_uring` into `libpicoquic-core.a` and statically links `liburing.a` into the Cython extension:
+
+```bash
+AIOPQUIC_IO_URING=1 ./build_picoquic.sh   # auto-fetches + builds liburing-2.7
+uv pip install -e '.[dev]'                 # re-cythonize with PICOQUIC_WITH_IO_URING define
+```
+
+**This currently has no runtime effect.** aiopquic's worker thread uses its own callback/SPSC-ring path and does not invoke `picoquic_packet_loop_uring`. The scaffolding is preserved so the worker can be migrated to io_uring later without re-discovering the build recipe (liburing submodule pin, picoquic header patch for kernel-uapi conflicts, ABI-critical define propagation through setup.py).
+
+Linux-only. Compatible CPU architectures: x86_64, ARM64. Build will hard-error if `AIOPQUIC_IO_URING=1` is set on macOS / BSD / Windows.
+
+> **ABI note:** `picoquic_network_thread_ctx_t` and `picoquic_socket_ctx_t` have conditional fields gated on `PICOQUIC_WITH_IO_URING`. The build-script + setup.py propagate the define to both picoquic-core *and* the Cython extension. A mismatch silently shifts `thread_is_ready` and other field offsets — the network thread appears to never become ready. Don't enable WITH_IO_URING in picoquic without also defining PICOQUIC_WITH_IO_URING in the Cython build.
+
 ## Known Limitations
 
 - **Free-threaded Python (3.14t) not yet supported** -- the TX-ring producer side, `TransportContext` lifecycle, and the WebTransport engine state currently rely on the GIL for serialization. FT support deferred until a per-context locking audit lands.

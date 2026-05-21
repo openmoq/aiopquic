@@ -557,7 +557,7 @@ static int aiopquic_wt_path_callback(
             uint32_t advertise_cap =
                 s->bridge->rx_ring_cap > 0
                     ? s->bridge->rx_ring_cap
-                    : AIOPQUIC_RX_RING_CAP_DEFAULT;
+                    : AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT;
             uint32_t fc_threshold = advertise_cap / AIOPQUIC_RX_FC_THRESHOLD_DIV;
             int first_touch = (sc->rx == NULL);
             if (first_touch) {
@@ -642,7 +642,7 @@ static int aiopquic_wt_path_callback(
             uint32_t advertise_cap =
                 s->bridge->rx_ring_cap > 0
                     ? s->bridge->rx_ring_cap
-                    : AIOPQUIC_RX_RING_CAP_DEFAULT;
+                    : AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT;
             int first_touch = (sc->rx == NULL);
             if (first_touch) {
                 (void)picoquic_set_app_flow_control(cnx, sid, 1);
