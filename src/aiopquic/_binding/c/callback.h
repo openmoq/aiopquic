@@ -45,11 +45,32 @@
  * for symmetry and gives ample staging headroom. */
 #define AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT (1u << 22)
 
-/* SPSC event ring entry count for the worker↔Python control
- * channel. One per TransportContext × 2 (rx + tx). Each entry
- * ~56 bytes; default 262144 = ~14 MB per ring = ~28 MB per
- * transport for control state. Power of two for fast masking. */
+/* Legacy shared SPSC ring default — preserved for backward-compat
+ * callers (Python QuicConfiguration.event_ring_capacity fallback).
+ * New code should size tx and rx independently via the two macros
+ * below. */
 #define AIOPQUIC_SPSC_RING_CAPACITY_DEFAULT 262144
+
+/* TX SPSC event ring default. Carries producer→worker notifications:
+ * one MARK_ACTIVE per send_stream_data call in pull-model (bytes
+ * live in sc->tx, not here), plus control msgs / WT commands / push-
+ * model byte-bearing entries. 2048 entries = ~20 ms of producer
+ * headroom at 100k events/s — small enough to backpressure early,
+ * large enough to absorb command bursts without starving the data
+ * path. Drainage threshold controlled by AIOPQUIC_TX_RING_WAKE_PCT.
+ * Power of two. */
+#define AIOPQUIC_TX_RING_CAP_DEFAULT 2048
+
+/* RX SPSC event ring default. Carries worker→asyncio notifications:
+ * stream_data / stream_fin / stream_open / connection events + the
+ * STREAM_TX_DRAINED and TX_RING_DRAINED wake events. Worker push
+ * rate is peer-paced, not producer-paced — undersizing causes
+ * silent event drops on multi-Gbps stream-churn workloads (see
+ * worker_rx_event_drops counter; aiopquic_rx_log_enabled stderr).
+ * 16384 entries chosen as the floor at which sustained MoQT
+ * subgroup churn at multi-Gbps stops triggering drops in lab.
+ * Power of two. */
+#define AIOPQUIC_RX_RING_CAP_DEFAULT 16384
 
 /* MAX_STREAM_DATA hysteresis: advance peer credit when ≥ 1/4 of
  * the ring has been drained since the last update. Matches
@@ -226,12 +247,26 @@ typedef struct {
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
 
-static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity) {
+/* Create a TransportContext with independent TX and RX SPSC ring
+ * sizes and an explicit drain-wake low-water percent. Pass 0 for
+ * any of the three to take the compile-time default
+ * (AIOPQUIC_TX_RING_CAP_DEFAULT / AIOPQUIC_RX_RING_CAP_DEFAULT /
+ * AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT). Ring caps must be powers of
+ * two — the caller (Cython binding) is responsible for rounding. */
+static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
+                                                   uint32_t rx_cap,
+                                                   uint32_t low_water_pct) {
+    if (tx_cap == 0) tx_cap = AIOPQUIC_TX_RING_CAP_DEFAULT;
+    if (rx_cap == 0) rx_cap = AIOPQUIC_RX_RING_CAP_DEFAULT;
+    if (low_water_pct == 0 || low_water_pct >= 100) {
+        low_water_pct = AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT;
+    }
+
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)calloc(1, sizeof(aiopquic_ctx_t));
     if (!ctx) return NULL;
 
-    ctx->rx_ring = spsc_ring_create(ring_capacity);
-    ctx->tx_ring = spsc_ring_create(ring_capacity);
+    ctx->rx_ring = spsc_ring_create(rx_cap);
+    ctx->tx_ring = spsc_ring_create(tx_cap);
     if (!ctx->rx_ring || !ctx->tx_ring) {
         spsc_ring_destroy(ctx->rx_ring);
         spsc_ring_destroy(ctx->tx_ring);
@@ -239,16 +274,17 @@ static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity) {
         return NULL;
     }
 
-    /* TX ring drain wake threshold: see AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT
-     * for rationale. Env override via AIOPQUIC_TX_RING_WAKE_PCT. */
+    /* TX ring drain wake threshold: explicit param wins, then env
+     * override (AIOPQUIC_TX_RING_WAKE_PCT), then the macro default.
+     * Computed against tx_cap, not the legacy single-cap. */
     {
-        uint32_t lw_pct = AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT;
+        uint32_t lw_pct = low_water_pct;
         const char* env_lw = getenv("AIOPQUIC_TX_RING_WAKE_PCT");
         if (env_lw && *env_lw) {
             int v = atoi(env_lw);
             if (v > 0 && v < 100) lw_pct = (uint32_t)v;
         }
-        ctx->tx_ring_low_water = (ring_capacity * lw_pct) / 100;
+        ctx->tx_ring_low_water = (tx_cap * lw_pct) / 100;
     }
 
 #ifdef __linux__
@@ -488,20 +524,15 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)callback_ctx;
     if (!ctx) return -1;
 
-    /* TX-side callback. Two paths:
-     *
-     * (1) PULL model: stream_ctx is a aiopquic_stream_buf_t* set by
-     *     picoquic_mark_active_stream(cnx, sid, 1, sb). Drain bytes
-     *     from the ring into picoquic's frame buffer up to the budget.
-     *     If the ring drains to empty AND fin_pending is set, signal
-     *     FIN; else keep the stream active.
-     *
-     * (2) PUSH model (legacy): stream_ctx is NULL. Drain a single
-     *     SPSC TX entry (whatever is at the head of the shared TX
-     *     ring). Only matches if the entry is for this stream_id.
-     *     This path has no upstream backpressure — caller is
-     *     responsible for not over-pushing into picoquic's internal
-     *     queue. Retained for the existing send_stream_data API.
+    /* TX-side callback. PULL model only: stream_ctx is an
+     * aiopquic_stream_ctx_t* set by picoquic_mark_active_stream
+     * (queued via SPSC_EVT_TX_MARK_ACTIVE). Drain bytes from the
+     * stream's sc->tx ring into picoquic's frame buffer up to the
+     * caller's budget. If sc->tx drains to empty AND fin_pending
+     * is set, signal FIN; else keep the stream active. The legacy
+     * push-model fallback (stream_ctx==NULL → drain a single
+     * SPSC_EVT_TX_STREAM_DATA/FIN entry from the shared TX ring)
+     * was removed in 0.3.5; mark_active never passes NULL.
      */
     if (fin_or_event == picoquic_callback_prepare_to_send) {
         ctx->worker_prepare_to_send_calls++;
@@ -576,26 +607,11 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             return 0;
         }
 
-        spsc_entry_t* tx_entry = spsc_ring_peek(ctx->tx_ring);
-        if (tx_entry && tx_entry->stream_id == stream_id &&
-            (tx_entry->event_type == SPSC_EVT_TX_STREAM_DATA ||
-             tx_entry->event_type == SPSC_EVT_TX_STREAM_FIN)) {
-            const uint8_t* data = (const uint8_t*)tx_entry->data_buf;
-            uint32_t to_send = tx_entry->data_length;
-            if (to_send > length) to_send = (uint32_t)length;
-
-            int is_fin = (tx_entry->event_type == SPSC_EVT_TX_STREAM_FIN);
-            int is_still_active = !is_fin;
-
-            uint8_t* buf = picoquic_provide_stream_data_buffer(
-                bytes, to_send, is_fin, is_still_active);
-            if (buf && data) {
-                memcpy(buf, data, to_send);
-            }
-            ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
-            aiopquic_maybe_fire_tx_ring_drained(ctx);
-            return 0;
-        }
+        /* stream_ctx==NULL on prepare_to_send is unexpected in pull-model
+         * 0.3.5+: mark_active is always called with a stream_ctx, so
+         * picoquic should never invoke this callback with a null ctx.
+         * Defensive: signal "no data" and return without consuming
+         * anything from the shared TX ring. */
         (void)picoquic_provide_stream_data_buffer(bytes, 0, 0, 0);
         return 0;
     }
@@ -865,16 +881,12 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                         aiopquic_maybe_fire_tx_ring_drained(ctx);
                         break;
                     }
-                    case SPSC_EVT_TX_STREAM_DATA:
-                    case SPSC_EVT_TX_STREAM_FIN: {
-                        const uint8_t* data = (const uint8_t*)entry->data_buf;
-                        int is_fin = (entry->event_type == SPSC_EVT_TX_STREAM_FIN);
-                        picoquic_add_to_stream(cnx, entry->stream_id,
-                                                data, entry->data_length, is_fin);
-                        ctx->cnt_tx_ring_pops++; spsc_ring_pop(ctx->tx_ring);
-                        aiopquic_maybe_fire_tx_ring_drained(ctx);
-                        break;
-                    }
+                    /* SPSC_EVT_TX_STREAM_DATA / SPSC_EVT_TX_STREAM_FIN
+                     * (push-model byte-bearing events) were removed in
+                     * 0.3.5. All stream writes now flow through the
+                     * pull-model path: producer commits to sc->tx and
+                     * pushes a MARK_ACTIVE event; picoquic later drains
+                     * via the prepare_to_send callback. */
                     case SPSC_EVT_TX_DATAGRAM: {
                         const uint8_t* data = (const uint8_t*)entry->data_buf;
                         picoquic_queue_datagram_frame(cnx, entry->data_length, data);

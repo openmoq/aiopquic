@@ -38,7 +38,6 @@ from aiopquic._binding.spsc_ring cimport (
     SPSC_EVT_WT_STREAM_DATA, SPSC_EVT_WT_STREAM_FIN,
     SPSC_EVT_WT_STREAM_LINK_RELEASE,
     SPSC_EVT_TX_RING_DRAINED,
-    SPSC_EVT_TX_STREAM_DATA, SPSC_EVT_TX_STREAM_FIN,
     SPSC_EVT_TX_DATAGRAM, SPSC_EVT_TX_CLOSE,
     SPSC_EVT_TX_MARK_ACTIVE, SPSC_EVT_TX_CONNECT,
     SPSC_EVT_TX_WT_OPEN, SPSC_EVT_TX_WT_CREATE_STREAM,
@@ -163,8 +162,6 @@ cdef extern from *:
     int picoquic_get_cnx_state(picoquic_cnx_t* cnx)
     uint64_t picoquic_get_data_sent(picoquic_cnx_t* cnx)
     uint64_t picoquic_get_data_received(picoquic_cnx_t* cnx)
-    int picoquic_add_to_stream(picoquic_cnx_t* cnx, uint64_t stream_id,
-                                const uint8_t* data, size_t length, int set_fin)
 
 cdef extern from "picoquic_packet_loop.h":
     ctypedef struct picoquic_packet_loop_param_t:
@@ -207,6 +204,8 @@ cdef extern from "c/callback.h":
         AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT
         AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT
         AIOPQUIC_SPSC_RING_CAPACITY_DEFAULT
+        AIOPQUIC_TX_RING_CAP_DEFAULT
+        AIOPQUIC_RX_RING_CAP_DEFAULT
         AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT
 
     ctypedef struct aiopquic_ctx_t:
@@ -237,7 +236,9 @@ cdef extern from "c/callback.h":
         uint64_t last_tx_ring_arm_ns
         uint64_t last_tx_ring_fire_ns
 
-    aiopquic_ctx_t* aiopquic_ctx_create(uint32_t ring_capacity)
+    aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
+                                          uint32_t rx_cap,
+                                          uint32_t low_water_pct)
     void aiopquic_ctx_destroy(aiopquic_ctx_t* ctx)
     void aiopquic_clear_rx(aiopquic_ctx_t* ctx)
     void aiopquic_notify_rx(aiopquic_ctx_t* ctx)
@@ -630,9 +631,31 @@ cdef class TransportContext:
     # Connection-global TX-ring drain wakeup. Lazy-allocated on first
     # access (needs a running event loop); see tx_ring_drain_event.
     cdef object _tx_ring_drain_event
+    # Test-friendly low-level pull primitive: per-(cnx, sid) sc_ptr
+    # tracker for tx_send_stream(). Production code uses
+    # QuicConnection.send_stream_data which manages its own per-cnx
+    # _stream_ctxs dict; this dict is for the bare-TransportContext
+    # test path where there's no QuicConnection wrapper.
+    cdef object _test_stream_ctxs
 
-    def __cinit__(self, uint32_t ring_capacity=DEFAULT_RING_CAPACITY):
-        self._ctx = aiopquic_ctx_create(ring_capacity)
+    def __cinit__(self,
+                  uint32_t ring_capacity=0,
+                  uint32_t tx_ring_cap=0,
+                  uint32_t rx_ring_cap=0,
+                  uint32_t tx_ring_low_water_pct=0):
+        # Resolution order for each SPSC cap:
+        #   1. Explicit per-direction kwarg (tx_ring_cap / rx_ring_cap)
+        #   2. Legacy shared ring_capacity (positional or kwarg)
+        #   3. 0 → C-side picks AIOPQUIC_{TX,RX}_RING_CAP_DEFAULT
+        # ring_capacity preserves the pre-0.3.5 positional signature
+        # (TransportContext(262144) still works).
+        cdef uint32_t tx_cap = tx_ring_cap if tx_ring_cap > 0 else ring_capacity
+        cdef uint32_t rx_cap = rx_ring_cap if rx_ring_cap > 0 else ring_capacity
+        if tx_cap > 0:
+            tx_cap = aiopquic_ceil_pow2_u32(tx_cap)
+        if rx_cap > 0:
+            rx_cap = aiopquic_ceil_pow2_u32(rx_cap)
+        self._ctx = aiopquic_ctx_create(tx_cap, rx_cap, tx_ring_low_water_pct)
         self._quic = NULL
         self._thread_ctx = NULL
         self._started = False
@@ -641,6 +664,7 @@ cdef class TransportContext:
         self._send_busy_stream_ring = 0
         self._send_alloc_fail = 0
         self._tx_ring_drain_event = None
+        self._test_stream_ctxs = {}
         if self._ctx is NULL:
             raise MemoryError("Failed to create transport context")
         # Register for module-level SIGUSR2 counter dump.
@@ -1352,6 +1376,60 @@ cdef class TransportContext:
                 picoquic_wake_up_network_thread(self._thread_ctx)
 
         return 0
+
+    def tx_send_stream(self, uintptr_t cnx_ptr, uint64_t stream_id,
+                        bytes data, bint end_stream=False,
+                        uint32_t stream_ring_cap=AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT):
+        """Test-friendly low-level pull-model send primitive.
+
+        Wraps tx_send_atomic with per-(cnx, sid) stream-context lifecycle
+        management. The first call for a given (cnx_ptr, stream_id)
+        allocates an aiopquic_stream_ctx_t via the C helper; subsequent
+        calls reuse it. The dict is process-local to this TransportContext.
+
+        Production code should use QuicConnection.send_stream_data, which
+        manages its own per-cnx _stream_ctxs dict and exposes a richer
+        BufferError-based backpressure API. This method exists for the
+        bare-TransportContext test path (tests/test_loopback.py and
+        derived integration / bench tests) so tests don't need to wrap
+        every TransportContext in a QuicConnection.
+
+        Raises:
+            BufferError: TX event ring or per-stream send ring is full
+                — caller may retry the SAME data without risk of
+                duplicating bytes on the wire (tx_send_atomic guarantees
+                all-or-nothing on retryable failures).
+            MemoryError: per-stream send ring allocation failed, or
+                aiopquic_stream_ctx_create returned NULL on first use.
+        """
+        cdef aiopquic_stream_ctx_t* sc
+        cdef uintptr_t sc_ptr
+        cdef int rc
+        key = (cnx_ptr, stream_id)
+        cached = self._test_stream_ctxs.get(key)
+        if cached is None:
+            sc = aiopquic_stream_ctx_create()
+            if sc is NULL:
+                raise MemoryError("aiopquic_stream_ctx_create returned NULL")
+            sc_ptr = <uintptr_t>sc
+            self._test_stream_ctxs[key] = sc_ptr
+        else:
+            sc_ptr = <uintptr_t>cached
+        rc = self.tx_send_atomic(stream_id, data, end_stream,
+                                  cnx_ptr, sc_ptr, stream_ring_cap)
+        if rc == 1:
+            raise BufferError(
+                f"TX event ring full (stream={stream_id})"
+            )
+        if rc == 2:
+            raise BufferError(
+                f"per-stream send ring full "
+                f"(stream={stream_id}, need={len(data) if data else 0})"
+            )
+        if rc < 0:
+            raise MemoryError(
+                f"tx_send_stream alloc failed (stream={stream_id})"
+            )
 
     @property
     def send_calls(self):

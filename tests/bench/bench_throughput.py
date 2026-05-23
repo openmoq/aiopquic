@@ -4,7 +4,7 @@ import time
 import pytest
 
 from _helpers import (
-    SPSC_EVT_STREAM_DATA, SPSC_EVT_STREAM_FIN, SPSC_EVT_TX_STREAM_FIN,
+    SPSC_EVT_STREAM_DATA, SPSC_EVT_STREAM_FIN,
 )
 
 
@@ -23,9 +23,7 @@ def test_bench_stream_throughput(benchmark, big_ring_pair, size_kb):
     def round_trip():
         sid = stream_id_box[0]
         stream_id_box[0] += 4
-        client.push_tx(SPSC_EVT_TX_STREAM_FIN, sid,
-                       data=payload, cnx_ptr=client_cnx)
-        client.wake_up()
+        client.tx_send_stream(client_cnx, sid, payload, end_stream=True)
         received = 0
         deadline = time.monotonic() + 60.0
         while received < len(payload) and time.monotonic() < deadline:

@@ -76,8 +76,12 @@ typedef enum {
                                            tracks the SPSC ring count, not
                                            per-sc byte ring fullness. */
 
-    SPSC_EVT_TX_STREAM_DATA = 128,
-    SPSC_EVT_TX_STREAM_FIN = 129,
+    /* Legacy push-model byte-bearing events (SPSC_EVT_TX_STREAM_DATA=128,
+     * SPSC_EVT_TX_STREAM_FIN=129) were removed in 0.3.5. Production code
+     * uses the pull-model path (per-stream sc->tx ring + MARK_ACTIVE event);
+     * tests use TransportContext.tx_send_stream which composes the same
+     * primitives. Codepoints 128 and 129 are reserved-unused for one
+     * release cycle to avoid silent re-use confusion. */
     SPSC_EVT_TX_DATAGRAM = 130,
     SPSC_EVT_TX_CLOSE = 131,
     SPSC_EVT_TX_STREAM_RESET = 132,
