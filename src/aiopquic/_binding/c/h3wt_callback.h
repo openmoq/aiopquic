@@ -508,6 +508,9 @@ static int aiopquic_wt_path_callback(
             }
             uint32_t pushed = aiopquic_stream_buf_push(
                 sc->rx, bytes, (uint32_t)length);
+            if (pushed > 0) {
+                aiopquic_sc_rx_bytes_pushed_add(pushed);
+            }
             if (pushed != length) {
                 s->bridge->worker_rx_byte_ring_overflow++;
                 if (aiopquic_rx_log_enabled()
@@ -575,6 +578,9 @@ static int aiopquic_wt_path_callback(
             if (length > 0) {
                 uint32_t pushed = aiopquic_stream_buf_push(
                     sc->rx, bytes, (uint32_t)length);
+                if (pushed > 0) {
+                    aiopquic_sc_rx_bytes_pushed_add(pushed);
+                }
                 if (pushed != length) {
                     s->bridge->worker_rx_byte_ring_overflow++;
                     return -1;

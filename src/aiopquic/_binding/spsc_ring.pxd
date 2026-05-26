@@ -21,6 +21,7 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_PACING_CHANGED
         SPSC_EVT_STREAM_TX_DRAINED
         SPSC_EVT_TX_RING_DRAINED
+        SPSC_EVT_STREAM_DESTROY
         SPSC_EVT_TX_DATAGRAM
         SPSC_EVT_TX_CLOSE
         SPSC_EVT_TX_STREAM_RESET

@@ -75,6 +75,17 @@ typedef enum {
                                            stream STREAM_TX_DRAINED design but
                                            tracks the SPSC ring count, not
                                            per-sc byte ring fullness. */
+    SPSC_EVT_STREAM_DESTROY = 17,       /* Cython-internal: pushed by the worker
+                                           after the LAST RX event on a raw-QUIC
+                                           stream whose sc->tx is NULL (i.e.
+                                           pure receiver, no send-side state).
+                                           SPSC FIFO order guarantees drain_rx
+                                           has popped every preceding
+                                           STREAM_DATA/FIN/RESET for this stream
+                                           and drained sc->rx before destroy
+                                           runs. Mirrors SPSC_EVT_WT_STREAM_LINK_RELEASE
+                                           for raw QUIC. entry.stream_ctx = sc;
+                                           not exposed to Python. */
 
     /* Legacy push-model byte-bearing events (SPSC_EVT_TX_STREAM_DATA=128,
      * SPSC_EVT_TX_STREAM_FIN=129) were removed in 0.3.5. Production code

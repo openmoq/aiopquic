@@ -2,46 +2,58 @@
 
 ## v0.3.5 (unreleased)
 
-### CC engagement (ROOT CAUSE fix)
+### RX flow control (release-blocker fix)
 
-- `picoquic_register_all_congestion_control_algorithms()` is now called at `TransportContext.start()`. Without this registry init, `picoquic_get_congestion_algorithm()` returned NULL for any name → `cnx->congestion_alg` was NULL → `alg_init` never ran → cwin pinned at `PICOQUIC_CWIN_INITIAL` (15360 bytes) for the connection's lifetime. Raw-QUIC throughput jumped from ~575 Mbps to 2+ Gbps after the fix.
-
-### TX pull-model
-
-- `TransportContext.tx_send_stream(cnx_ptr, stream_id, data, end_stream, stream_ring_cap)` — low-level pull-model send primitive. Wraps `tx_send_atomic` with per-`(cnx, sid)` `aiopquic_stream_ctx_t` lifecycle management. Raises `BufferError` on ring-full, `MemoryError` on alloc fail. Production code continues to use `QuicConnection.send_stream_data`; this method exists for the bare-`TransportContext` test path.
-- Legacy push-model events `SPSC_EVT_TX_STREAM_DATA` / `SPSC_EVT_TX_STREAM_FIN` (codepoints 128, 129) removed: worker dispatch case, `prepare_to_send` push fallback for `stream_ctx==NULL`, `picoquic_add_to_stream` cdef extern, Cython import. Zero production callers; test files migrated to `tx_send_stream`. Codepoints reserved-unused for one release cycle.
-- Engine-path `_enqueue_raw` now dispatches `_EVT_STREAM_TX_DRAINED` (was missing the mirror case present in `_handle_raw_event`). Fixes 2-proc pull-model producer hangs.
-
-### TX/RX ring caps
-
-- `aiopquic_ctx_create(tx_cap, rx_cap, low_water_pct)` — independent per-direction SPSC ring caps. Defaults: TX 2048, RX 16384 entries (was a shared 262144). Sized against observed peaks (healthy ~700 RX events, cliff ~12K; 16K is 1.3× worst observed with zero overflows ever recorded). Reduces per-connection memory footprint significantly.
-- `TransportContext.__cinit__` accepts `tx_ring_cap` / `rx_ring_cap` / `tx_ring_low_water_pct` kwargs (back-compat: legacy positional `ring_capacity` still works).
-- `AIOPQUIC_TX_RING_WAKE_PCT` env override (default 50%) tunes the connection-global TX-ring drain wake threshold.
+- Hysteresis-gated, per-cycle FC push: `drain_rx` / `drain_rx_callback` dedupe `SPSC_EVT_TX_OPEN_FLOW_CONTROL` to at most one per stream per cycle; further skipped when `rx_consumed` hasn't advanced by `ring_cap / 16` (~256 KB at default 4 MB cap). Reduces FC events from ~280K/s to single thousands/s, eliminating the `rx_event_ring` overflow cliff.
+- `aiopquic_stream_ctx_t.bytes_pending_release` atomic + reference-counted `StreamChunk`. Worker grant = `buf_free − pending`. `AIOPQUIC_FC_RAW=1` bypasses for diagnostics.
+- Sender-side sc lifecycle gap: no terminal callback after our TX FIN; bounded by stream count, deferred to 0.3.6 (xfail test surfaces it).
+- WT-side sc destroy: `picohttp_callback_free → wt_link_destroy` not firing under MoQT subgroup workloads (`sc_destroyed_total = 0`). Bounded by stream count × ring_cap; deferred to 0.3.6.
 
 ### Observability
 
-- `--cc-algo` flag plumbed across `MOQTServer` / `MOQTClient` (aiomoqt) and 11 example tools — passes through to `QuicConfiguration.congestion_control_algorithm`. Default BBR.
-- SIGUSR2 counter dump (registered by aiomoqt's `taskdump` when `AIOMOQT_TASK_DUMP=1`): per-`TransportContext` ring depths, push/pop/arm/fire deltas, ns-resolution timestamps, per-stream `arms` / `fires` / `dropped` / `tx_used` / `pending`. Drives forensic diagnosis of wake-chain stalls.
+- Process-wide counters: `sc_{created,destroyed,alive}_total`, `chunks_alive_total`, `sc_rx_bytes_{pushed,popped}_total`, `sc_rx_bytes_in_flight`. Per-cnx: `fc_credit_{pushed,handled,dropped}`. All in `TransportContext.counters`.
+- `dump_all_counters` per-stream walk is opt-in via `AIOPQUIC_DUMP_PER_STREAM=1` (default ctx-level dump is safe; per-stream walks deref stale `_stream_ctxs` entries — proper cleanup deferred).
+- `TransportContext.enable_sigusr2_dump()` low-level entry; aiomoqt's `taskdump.install()` remains canonical.
+
+### CC engagement (root-cause fix)
+
+- `picoquic_register_all_congestion_control_algorithms()` now called at `TransportContext.start()`. Without it `cnx->congestion_alg` was NULL → cwin pinned at IW=15360. Raw-QUIC: ~575 Mbps → 2+ Gbps.
+
+### TX pull-model
+
+- `TransportContext.tx_send_stream(cnx, sid, data, end_stream, ring_cap)` — low-level pull primitive with per-`(cnx, sid)` sc lifecycle. Raises `BufferError` on ring-full.
+- Legacy push events `SPSC_EVT_TX_STREAM_DATA` / `_FIN` (codepoints 128/129) removed; reserved one release cycle.
+- Engine-path `_enqueue_raw` dispatches `_EVT_STREAM_TX_DRAINED` (fixes 2-proc pull-model producer hangs).
+
+### TX/RX ring caps
+
+- `aiopquic_ctx_create(tx_cap, rx_cap, low_water_pct)` — independent per-direction caps. Defaults: TX 2048, RX 16384 entries (was shared 262144). `AIOPQUIC_TX_RING_WAKE_PCT` env override.
+- `TransportContext.__cinit__` accepts `tx_ring_cap` / `rx_ring_cap` / `tx_ring_low_water_pct` (back-compat: positional `ring_capacity` still works).
+
+### Tests
+
+- `tests/bench/test_rx_fc_counters.py` (4 tests, 1 xfail for the sender-side sc gap).
+- `tests/bench/test_rx_bloat_during_load.py` — RSS-bound, parametrized over QUIC and WT.
+
+### Docs
+
+- `WAKE_PROTOCOL.md` rewritten: event-vs-data ring model, four-datapath summary, QUIC-vs-WT differences, naming intent (`tx_ring → tx_event_ring` rename deferred to 0.3.6). Existing 8 sequence diagrams + SIGUSR2 triage retained.
+
+### Tooling / observability surface
+
+- `--cc-algo` flag on `MOQTServer` / `MOQTClient` and 11 example tools; default BBR.
+- `python -m aiopquic.versions` / `aiopquic-versions` enriched with picoquic + picotls `git describe --tags --always --long` + commit date + subject.
 - `AIOPQUIC_RX_LOG=1` surfaces `rx_event_drops` and `rx_byte_ring_overflow` on stderr.
-- `python -m aiopquic.versions` / `aiopquic-versions` enriched with picoquic + picotls `git describe --tags --always --long` + commit date + subject (was bare 40-char SHA). `setup.py` captures via new `_git_info()`; `_build_info.py` adds `PICOQUIC_DESCRIBE` / `PICOQUIC_DATE` / `PICOQUIC_SUBJECT` (and PICOTLS equivalents). `versions.py` falls back to `unknown` for older `_build_info.py` files.
+- `[tool.ruff] line-length = 100` (matches aiomoqt).
 
 ### Build
 
-- Vendored `third_party/liburing` submodule pinned at `liburing-2.7`. Auto-fetched and built static-only when `AIOPQUIC_IO_URING=1`; otherwise inert (no fetch, no link).
-- New `AIOPQUIC_PERF=1` env switch in `build_picoquic.sh` enables portable host-tuned optimizations (Fusion AES-GCM on x86_64, `DISABLE_DEBUG_PRINTF`, `-O3 -march=native -flto`). Default OFF; never enabled in PyPI wheels (machine-specific).
-- New `AIOPQUIC_IO_URING=1` env switch (EXPERIMENTAL / DORMANT). Builds `picoquic_packet_loop_uring` into `libpicoquic-core.a` and statically links liburing into the Cython extension. **No runtime effect today** — aiopquic's worker thread does not invoke the io_uring packet loop. Scaffolding preserved for future worker migration. Linux-only; hard-errors on macOS / BSD / Windows. ABI footgun documented in README and propagated automatically via setup.py (`PICOQUIC_WITH_IO_URING` define mirrored to picoquic-core build and Cython compile to keep `picoquic_network_thread_ctx_t` / `picoquic_socket_ctx_t` layouts aligned).
-- New picoquic patch `patches/0002-picoquic-sockloop-drop-system-io_uring-header.patch` removes `#include <linux/io_uring.h>` from `sockloop.c`; liburing's bundled header provides the same superset, and the system uapi on older distros (e.g. Ubuntu 22.04's 5.15 LTS) conflicts via shared `LINUX_IO_URING_H` include guard. Patch is dead code when `WITH_IO_URING=OFF`.
-- Wheel perf flags via `[tool.cibuildwheel.linux.environment]`: arch-agnostic `-flto` + `DISABLE_DEBUG_PRINTF` for all Linux; x86_64 override adds `-march=x86-64-v3` + `PTLS_WITH_FUSION` (Haswell+ baseline; older systems install via sdist). aarch64 builds unaffected.
-- `bootstrap_python.sh`: `PYTHON_VERSION="cpython-3.14"` (unambiguous GIL build; bare `3.14` could resolve to the free-threaded variant when both are uv-managed). Adds `setuptools_scm[toml]>=6.2` to the install list so `--no-build-isolation` editable installs derive proper versions from git tags.
-
-### Tooling
-
-- `[tool.ruff] line-length = 100` standard (matches aiomoqt).
-
-- Vendored `third_party/liburing` submodule pinned at `liburing-2.7`. Auto-fetched and built static-only when `AIOPQUIC_IO_URING=1`; otherwise inert (no fetch, no link).
-- New `AIOPQUIC_PERF=1` env switch in `build_picoquic.sh` enables portable host-tuned optimizations (Fusion AES-GCM on x86_64, `DISABLE_DEBUG_PRINTF`, `-O3 -march=native -flto`). Default OFF; never enabled in PyPI wheels (machine-specific).
-- New `AIOPQUIC_IO_URING=1` env switch (EXPERIMENTAL / DORMANT). Builds `picoquic_packet_loop_uring` into `libpicoquic-core.a` and statically links liburing into the Cython extension. **No runtime effect today** — aiopquic's worker thread does not invoke the io_uring packet loop. Scaffolding preserved for future worker migration. Linux-only; hard-errors on macOS / BSD / Windows. ABI footgun documented in README and propagated automatically via setup.py (`PICOQUIC_WITH_IO_URING` define mirrored to picoquic-core build and Cython compile to keep `picoquic_network_thread_ctx_t` / `picoquic_socket_ctx_t` layouts aligned).
-- New picoquic patch `patches/0002-picoquic-sockloop-drop-system-io_uring-header.patch` removes `#include <linux/io_uring.h>` from `sockloop.c`; liburing's bundled header provides the same superset, and the system uapi on older distros (e.g. Ubuntu 22.04's 5.15 LTS) conflicts via shared `LINUX_IO_URING_H` include guard. Patch is dead code when `WITH_IO_URING=OFF`.
+- `AIOPQUIC_PERF=1` env switch in `build_picoquic.sh`: host-tuned `-O3 -march=native -flto` + Fusion AES-GCM on x86_64 + `DISABLE_DEBUG_PRINTF`. Default OFF; never used in PyPI wheels.
+- `AIOPQUIC_IO_URING=1` env switch (EXPERIMENTAL / DORMANT). Builds `picoquic_packet_loop_uring` into `libpicoquic-core.a` and statically links liburing; no runtime effect today (worker still uses portable loop). Linux-only. ABI footgun documented; setup.py mirrors `PICOQUIC_WITH_IO_URING` to picoquic build and Cython compile.
+- New patch `patches/0002-picoquic-sockloop-drop-system-io_uring-header.patch` (dead code when `WITH_IO_URING=OFF`).
+- Wheel perf flags via `[tool.cibuildwheel.linux.environment]`: `-flto` + `DISABLE_DEBUG_PRINTF` for all Linux; x86_64 adds `-march=x86-64-v3` + `PTLS_WITH_FUSION` (Haswell+; older systems install via sdist).
+- Vendored `third_party/liburing` submodule pinned at `liburing-2.7`; auto-fetched / built static-only when `AIOPQUIC_IO_URING=1`, inert otherwise.
+- `bootstrap_python.sh`: `PYTHON_VERSION="cpython-3.14"` (unambiguous GIL build); adds `setuptools_scm[toml]>=6.2` for editable installs.
 
 ## v0.3.4 (2026-05-19)
 
