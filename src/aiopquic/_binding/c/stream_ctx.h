@@ -105,7 +105,7 @@ typedef struct {
      * monotonic timestamp. */
     uint64_t cnt_drain_arms;        /* Python armed sc->tx_drain_pending */
     uint64_t cnt_drain_fires;       /* worker fired SPSC_EVT_STREAM_TX_DRAINED */
-    uint64_t cnt_drain_dropped;     /* CAS won but rx_ring push failed → re-arm */
+    uint64_t cnt_drain_dropped;     /* CAS won but rx_event_ring push failed → re-arm */
     uint64_t last_drain_arm_ns;     /* CLOCK_MONOTONIC of last arm */
     uint64_t last_drain_fire_ns;    /* CLOCK_MONOTONIC of last fire */
     /* Reference count for lifecycle management. Starts at 1 (the
@@ -150,6 +150,64 @@ static inline uint64_t aiopquic_cnt_sc_destroyed_load(void) {
 }
 static inline int64_t aiopquic_cnt_chunks_alive_load(void) {
     return atomic_load_explicit(&aiopquic_cnt_chunks_alive,
+                                 memory_order_relaxed);
+}
+
+/* Per-site sc create/ref/destroy counters for Python-side call sites
+ * (added 2026-06-06). C-side counters live on aiopquic_ctx_t (per cnx).
+ * Process-wide here because chunk dealloc, rx_event drain, and the
+ * Python create/destroy helpers don't reliably have ctx in scope.
+ * Invariant at process end:
+ *   sc_created == sc_destroyed
+ *   (cnt_sc_create_raw_quic + cnt_sc_create_wt_link + cnt_sc_create_python_helper
+ *    + cnt_sc_ref_fc_credit + cnt_sc_ref_chunk_wrap)
+ *   == (cnt_sc_destroy_wt_link + cnt_sc_destroy_fc_credit_pushfail
+ *       + cnt_sc_destroy_fc_credit_worker + cnt_sc_destroy_chunk_dealloc
+ *       + cnt_sc_destroy_rx_event + cnt_sc_destroy_python_helper) */
+static _Atomic(uint64_t) aiopquic_cnt_sc_ref_chunk_wrap = 0;
+static _Atomic(uint64_t) aiopquic_cnt_sc_destroy_chunk_dealloc = 0;
+static _Atomic(uint64_t) aiopquic_cnt_sc_destroy_rx_event = 0;
+static _Atomic(uint64_t) aiopquic_cnt_sc_create_python_helper = 0;
+static _Atomic(uint64_t) aiopquic_cnt_sc_destroy_python_helper = 0;
+
+static inline void aiopquic_cnt_sc_ref_chunk_wrap_inc(void) {
+    atomic_fetch_add_explicit(&aiopquic_cnt_sc_ref_chunk_wrap, 1,
+                               memory_order_relaxed);
+}
+static inline void aiopquic_cnt_sc_destroy_chunk_dealloc_inc(void) {
+    atomic_fetch_add_explicit(&aiopquic_cnt_sc_destroy_chunk_dealloc, 1,
+                               memory_order_relaxed);
+}
+static inline void aiopquic_cnt_sc_destroy_rx_event_inc(void) {
+    atomic_fetch_add_explicit(&aiopquic_cnt_sc_destroy_rx_event, 1,
+                               memory_order_relaxed);
+}
+static inline void aiopquic_cnt_sc_create_python_helper_inc(void) {
+    atomic_fetch_add_explicit(&aiopquic_cnt_sc_create_python_helper, 1,
+                               memory_order_relaxed);
+}
+static inline void aiopquic_cnt_sc_destroy_python_helper_inc(void) {
+    atomic_fetch_add_explicit(&aiopquic_cnt_sc_destroy_python_helper, 1,
+                               memory_order_relaxed);
+}
+static inline uint64_t aiopquic_cnt_sc_ref_chunk_wrap_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_sc_ref_chunk_wrap,
+                                 memory_order_relaxed);
+}
+static inline uint64_t aiopquic_cnt_sc_destroy_chunk_dealloc_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_sc_destroy_chunk_dealloc,
+                                 memory_order_relaxed);
+}
+static inline uint64_t aiopquic_cnt_sc_destroy_rx_event_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_sc_destroy_rx_event,
+                                 memory_order_relaxed);
+}
+static inline uint64_t aiopquic_cnt_sc_create_python_helper_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_sc_create_python_helper,
+                                 memory_order_relaxed);
+}
+static inline uint64_t aiopquic_cnt_sc_destroy_python_helper_load(void) {
+    return atomic_load_explicit(&aiopquic_cnt_sc_destroy_python_helper,
                                  memory_order_relaxed);
 }
 
@@ -203,7 +261,7 @@ static inline void aiopquic_stream_ctx_ref(aiopquic_stream_ctx_t* sc) {
 }
 
 /* Python-side arm for the per-stream sc->tx drain signal. Mirrors
- * the connection-global aiopquic_arm_tx_ring_drain_pending in
+ * the connection-global aiopquic_arm_tx_event_ring_drain_pending in
  * callback.h. Use when the Python writer wants to wait for sc->tx
  * to drain at a soft threshold (e.g. a byte-budget cap below the
  * hard sc->tx ring capacity) rather than waiting for the natural

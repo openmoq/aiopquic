@@ -20,8 +20,9 @@ cdef extern from "c/spsc_ring.h":
         SPSC_EVT_PATH_DELETED
         SPSC_EVT_PACING_CHANGED
         SPSC_EVT_STREAM_TX_DRAINED
-        SPSC_EVT_TX_RING_DRAINED
+        SPSC_EVT_TX_EVENT_RING_DRAINED
         SPSC_EVT_STREAM_DESTROY
+        SPSC_EVT_WT_STREAM_DESTROY
         SPSC_EVT_TX_DATAGRAM
         SPSC_EVT_TX_CLOSE
         SPSC_EVT_TX_STREAM_RESET
@@ -63,7 +64,6 @@ cdef extern from "c/spsc_ring.h":
     spsc_ring_t* spsc_ring_create(uint32_t capacity)
     void spsc_ring_destroy(spsc_ring_t* ring)
     uint32_t spsc_ring_count(spsc_ring_t* ring)
-    uint64_t spsc_ring_bytes_pending(spsc_ring_t* ring)
     int spsc_ring_full(spsc_ring_t* ring)
     int spsc_ring_empty(spsc_ring_t* ring)
     int spsc_ring_push(spsc_ring_t* ring, const spsc_entry_t* entry,

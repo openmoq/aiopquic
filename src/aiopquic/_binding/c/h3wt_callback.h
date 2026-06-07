@@ -165,6 +165,9 @@ static inline aiopquic_wt_stream_link_t* aiopquic_wt_stream_link_create(
         free(link);
         return NULL;
     }
+    if (s && s->bridge) {
+        s->bridge->cnt_sc_create_wt_link++;
+    }
     link->kind = AIOPQUIC_WT_CTX_LINK;
     link->session = s;
     link->sc = sc;
@@ -175,6 +178,12 @@ static inline aiopquic_wt_stream_link_t* aiopquic_wt_stream_link_create(
 static inline void aiopquic_wt_stream_link_destroy(
         aiopquic_wt_stream_link_t* link) {
     if (!link) return;
+    /* No session/bridge deref here: at cnx-teardown, session is freed
+     * (h3wt_callback.h:~1115 / TX_WT_DEREGISTER) BEFORE every pending
+     * LINK_RELEASE has been popped from rx_event_ring. Touching
+     * link->session in this function = UAF on shutdown. The destroy
+     * count is captured at call sites (close walker + drain_rx
+     * LINK_RELEASE pop) where session validity is guaranteed. */
     if (link->sc) aiopquic_stream_ctx_destroy(link->sc);
     link->kind = 0;  /* clear canary */
     free(link);
@@ -264,7 +273,7 @@ static inline void aiopquic_wt_push_event_with_sc(
     entry.data_buf = sc;      /* borrowed; freed by link_destroy */
     entry.data_length = 0;    /* sentinel: do not free on pop */
     entry.is_fin = is_fin;
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_ring, &entry);
+    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
     } else {
@@ -276,15 +285,15 @@ static inline void aiopquic_wt_push_event_with_sc(
                 && s->bridge->worker_rx_event_drops <= 100) {
             fprintf(stderr,
                 "[aiopquic_rx] WT EVENT RING FULL (sc): drop "
-                "stream=%llu evt=%u (rx_ring entries=%u)\n",
+                "stream=%llu evt=%u (rx_event_ring entries=%u)\n",
                 (unsigned long long)stream_id, event_type,
-                spsc_ring_count(s->bridge->rx_ring));
+                spsc_ring_count(s->bridge->rx_event_ring));
         }
     }
 }
 
 /*
- * Push a WT event to the bridge's rx_ring. data may be NULL/0 for
+ * Push a WT event to the bridge's rx_event_ring. data may be NULL/0 for
  * pure events. Caller (picoquic thread) must ensure session is set.
  */
 static inline void aiopquic_wt_push_event(
@@ -300,7 +309,7 @@ static inline void aiopquic_wt_push_event(
     entry.error_code = error_code;
     entry.cnx = s->cnx;
     entry.stream_ctx = s;       /* session ptr for demux */
-    int ret = spsc_ring_push(s->bridge->rx_ring, &entry, data, data_len);
+    int ret = spsc_ring_push(s->bridge->rx_event_ring, &entry, data, data_len);
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
     } else {
@@ -312,9 +321,9 @@ static inline void aiopquic_wt_push_event(
                 && s->bridge->worker_rx_event_drops <= 100) {
             fprintf(stderr,
                 "[aiopquic_rx] WT EVENT RING FULL: drop "
-                "stream=%llu evt=%u (rx_ring entries=%u)\n",
+                "stream=%llu evt=%u (rx_event_ring entries=%u)\n",
                 (unsigned long long)stream_id, event_type,
-                spsc_ring_count(s->bridge->rx_ring));
+                spsc_ring_count(s->bridge->rx_event_ring));
         }
     }
 }
@@ -335,7 +344,7 @@ static inline void aiopquic_wt_push_new_stream(
     entry.stream_ctx = s;
     entry.data_buf = sc;     /* BORROWED */
     entry.data_length = 0;   /* sentinel: do not free on pop */
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_ring, &entry);
+    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
     } else {
@@ -354,6 +363,34 @@ static inline void aiopquic_wt_push_new_stream(
  * Ordering is the load-bearing property: this is the mechanism that
  * prevents the BORROWED-sc UAF that motivated the LINK_RELEASE pattern.
  */
+/*
+ * Push WT_STREAM_DESTROY — surfaces "stream is fully retired" to the
+ * WebTransportSession dispatcher so it can pop _stream_tx_ctxs[sid]
+ * etc. Must be pushed BEFORE link_release so the FIFO order on the
+ * SPSC ring guarantees Python sees the destroy event while the link
+ * (and its sc) are still alive. drain_rx surfaces this and does NOT
+ * call any destroy — LINK_RELEASE owns the sc ref drop.
+ */
+static inline void aiopquic_wt_push_stream_destroy(
+        aiopquic_wt_session_t* s,
+        uint64_t stream_id) {
+    spsc_entry_t entry = {0};
+    entry.event_type = SPSC_EVT_WT_STREAM_DESTROY;
+    entry.stream_id = stream_id;
+    entry.cnx = s->cnx;
+    entry.stream_ctx = s;  /* session ptr for asyncio routing */
+    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
+    if (ret == 0) {
+        aiopquic_notify_rx(s->bridge);
+    } else {
+        /* RX ring full. The Python dict will retain a stale entry
+         * for this stream until session close clears it. Bounded
+         * by per-cnx stream count; surface via the existing drop
+         * counter so sustained drops are visible. */
+        s->bridge->worker_rx_event_drops++;
+    }
+}
+
 static inline void aiopquic_wt_push_link_release(
         aiopquic_wt_session_t* s,
         uint64_t stream_id,
@@ -365,7 +402,7 @@ static inline void aiopquic_wt_push_link_release(
     entry.stream_ctx = s;
     entry.data_buf = link;
     entry.data_length = 0;
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_ring, &entry);
+    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
     } else {
@@ -379,7 +416,7 @@ static inline void aiopquic_wt_push_link_release(
         if (aiopquic_rx_log_enabled()
                 && s->bridge->worker_rx_event_drops <= 100) {
             fprintf(stderr,
-                "[aiopquic_rx] LINK_RELEASE drop on full rx_ring: "
+                "[aiopquic_rx] LINK_RELEASE drop on full rx_event_ring: "
                 "leaking link for stream=%llu\n",
                 (unsigned long long)stream_id);
         }
@@ -404,7 +441,7 @@ static inline void aiopquic_wt_push_stream_created(
     entry.stream_ctx = s;
     entry.data_buf = sc;     /* BORROWED, NULL on error */
     entry.data_length = 0;
-    int ret = spsc_ring_push_borrowed(s->bridge->rx_ring, &entry);
+    int ret = spsc_ring_push_borrowed(s->bridge->rx_event_ring, &entry);
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
     } else {
@@ -417,7 +454,7 @@ static inline void aiopquic_wt_push_stream_created(
  * Runs in the picoquic network thread.
  *
  * Translates picohttp_call_back_event_t → SPSC_EVT_WT_* and pushes
- * to rx_ring. Special-cases the control stream: data on the control
+ * to rx_event_ring. Special-cases the control stream: data on the control
  * stream is capsule bytes; we feed it to picowt_receive_capsule and
  * surface CLOSE/DRAIN as session events instead of stream events.
  *
@@ -661,7 +698,7 @@ static int aiopquic_wt_path_callback(
                 drain_entry.stream_id = sid;
                 drain_entry.cnx = s->cnx;
                 drain_entry.stream_ctx = s;
-                if (spsc_ring_push(s->bridge->rx_ring,
+                if (spsc_ring_push(s->bridge->rx_event_ring,
                                    &drain_entry, NULL, 0) == 0) {
                     sc->cnt_drain_fires++;
                     sc->last_drain_fire_ns = aiopquic_now_ns();
@@ -686,13 +723,13 @@ static int aiopquic_wt_path_callback(
         break;
 
     case picohttp_callback_provide_datagram: {
-        spsc_entry_t* tx = spsc_ring_peek(s->bridge->tx_ring);
+        spsc_entry_t* tx = spsc_ring_peek(s->bridge->tx_event_ring);
         if (tx && tx->event_type == SPSC_EVT_TX_DATAGRAM) {
             uint32_t to_send = tx->data_length;
             if (to_send > length) to_send = (uint32_t)length;
             void* buf = h3zero_provide_datagram_buffer(stream_ctx, to_send, 0);
             if (buf && tx->data_buf) memcpy(buf, tx->data_buf, to_send);
-            spsc_ring_pop(s->bridge->tx_ring);
+            spsc_ring_pop(s->bridge->tx_event_ring);
         }
         break;
     }
@@ -770,7 +807,28 @@ static int aiopquic_wt_path_callback(
         if (link && stream_ctx
                 && stream_ctx->path_callback_ctx == link) {
             stream_ctx->path_callback_ctx = NULL;
+            /* Order: STREAM_DESTROY first (Python dict cleanup),
+             * then LINK_RELEASE (link + sc ref drop). FIFO on the
+             * SPSC ring preserves this ordering at the consumer. */
+            aiopquic_wt_push_stream_destroy(s, sid);
             aiopquic_wt_push_link_release(s, sid, link);
+        } else if (link) {
+            /* Diagnostic: cleanup skipped despite a link being
+             * provided via path_app_ctx. Tracks the leak signature
+             * for the May-23 sub-side retention investigation. */
+            s->bridge->cnt_wt_callback_free_skipped++;
+            if (aiopquic_wt_diag_enabled()) {
+                fprintf(stderr,
+                    "[wt-diag] callback_free SKIP sid=%llu link=%p "
+                    "stream_ctx=%p path_ctx=%p match=%d\n",
+                    (unsigned long long)sid,
+                    (void*)link,
+                    (void*)stream_ctx,
+                    stream_ctx ? stream_ctx->path_callback_ctx : NULL,
+                    stream_ctx
+                        ? (stream_ctx->path_callback_ctx == link) : 0);
+                fflush(stderr);
+            }
         }
         break;
 
@@ -835,7 +893,7 @@ static int aiopquic_wt_server_path_callback(
     entry.stream_id = s->control_stream_id;
     entry.cnx = cnx;
     entry.stream_ctx = s;
-    int rc = spsc_ring_push(bridge->rx_ring, &entry,
+    int rc = spsc_ring_push(bridge->rx_event_ring, &entry,
                              path_bytes, (uint32_t)path_len);
     if (rc == 0) aiopquic_notify_rx(bridge);
     return 0;
@@ -912,6 +970,11 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         s->h3_ctx = h3_ctx;
         s->control_stream = control_stream;
         s->control_stream_id = control_stream->stream_id;
+        /* Suppress h3zero's stdout banner on client-side cnx close
+         * ("Received a connection close request"). h3zero_common.c
+         * gates on !ctx->no_print; raw-QUIC has no equivalent print
+         * so this matches WT to raw-QUIC behavior. */
+        h3_ctx->no_print = 1;
 
         rc = picowt_connect(cnx, h3_ctx, control_stream,
                               sni_buf, path_buf,
@@ -1038,6 +1101,9 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
                             if (lk->session == s) {
                                 st->path_callback = NULL;
                                 st->path_callback_ctx = NULL;
+                                if (s->bridge) {
+                                    s->bridge->cnt_sc_destroy_wt_link_close_walker++;
+                                }
                                 aiopquic_wt_stream_link_destroy(lk);
                             }
                         }

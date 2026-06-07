@@ -5,6 +5,7 @@ events into QuicEvent objects that match qh3's event interface.
 """
 
 import asyncio
+import contextlib
 import os
 from enum import IntEnum
 
@@ -44,6 +45,7 @@ _EVT_READY = 6
 _EVT_ALMOST_READY = 7
 _EVT_DATAGRAM = 8
 _EVT_STREAM_TX_DRAINED = 15
+_EVT_STREAM_DESTROY = 17
 
 # TX event types
 _TX_STREAM_DATA = 128
@@ -266,7 +268,7 @@ class QuicConnection:
             # wakes, loops, observes _closed and exits cleanly.
             for ev in self._stream_tx_drain_events.values():
                 ev.set()
-            ring_ev = getattr(self._transport, '_tx_ring_drain_event', None)
+            ring_ev = getattr(self._transport, '_tx_event_ring_drain_event', None)
             if ring_ev is not None:
                 ring_ev.set()
             # picoquic's close callback has fired — worker has stopped
@@ -301,6 +303,21 @@ class QuicConnection:
                 event = asyncio.Event()
                 self._stream_tx_drain_events[stream_id] = event
             event.set()
+        elif evt_type == _EVT_STREAM_DESTROY:
+            # Stream fully retired by picoquic — drop our cached
+            # pointer so the dict doesn't accumulate stale entries.
+            # The C side has already dropped the stream-lifetime ref
+            # by the time this fires; don't deref.
+            # Wake any producer parked in await sc_event.wait() with
+            # the about-to-be-popped Event still in hand. Without this
+            # set(), the waiter would deadlock — the popped Event is
+            # no longer reachable from this dict so no STREAM_TX_DRAINED
+            # will ever set it again. Mirrors the _EVT_CLOSE handler.
+            ev = self._stream_tx_drain_events.get(stream_id)
+            if ev is not None:
+                ev.set()
+            self._stream_ctxs.pop(stream_id, None)
+            self._stream_tx_drain_events.pop(stream_id, None)
 
     def get_tx_drain_event(self, stream_id: int) -> asyncio.Event:
         """Return the asyncio.Event signalling that the picoquic
@@ -321,6 +338,70 @@ class QuicConnection:
             event = asyncio.Event()
             self._stream_tx_drain_events[stream_id] = event
         return event
+
+    def stream_tx_buf_used(self, stream_id: int) -> int:
+        """Per-stream sc->tx bytes-in-flight — the load-bearing
+        backpressure signal in the pull model.
+
+        Returns the count of bytes currently queued in this stream's
+        sc->tx ring waiting for the picoquic worker to pull them onto
+        the wire. Companion of arm_stream_tx_drain_pending +
+        get_tx_drain_event: read used → if over budget, arm the
+        per-stream drain-pending flag and await the per-stream event.
+        Unknown stream_id returns 0.
+
+        Conceptually `used` is how full the per-stream byte pipe is
+        between Python (producer) and picoquic (consumer):
+          - bytes you've pushed via send_stream_data but not yet on
+            the wire
+          - drained monotonically by the worker; wake via the
+            per-stream sc->tx drain event
+          - cap_minus_used = headroom before next push raises
+            BufferError
+          - used / wire_rate ≈ latency this queue adds above wire RTT
+        """
+        sc_ptr = self._stream_ctxs.get(stream_id, 0)
+        if not sc_ptr or self._transport is None:
+            return 0
+        return self._transport.stream_tx_buf_used(sc_ptr)
+
+    def arm_stream_tx_drain_pending(self, stream_id: int) -> None:
+        """Arm the per-stream sc->tx_drain_pending flag so the next
+        worker drain of this stream's sc->tx fires
+        SPSC_EVT_STREAM_TX_DRAINED — even if sc->tx wasn't full.
+        Pair with get_tx_drain_event(stream_id) for the canonical
+        clear-arm-recheck-wait pattern against a byte budget below
+        sc->tx full. No-op on unknown stream_id."""
+        sc_ptr = self._stream_ctxs.get(stream_id, 0)
+        if not sc_ptr or self._transport is None:
+            return
+        self._transport.arm_stream_tx_drain_pending(sc_ptr)
+
+    def clear_stream_tx_drain_pending(self, stream_id: int) -> None:
+        """Clear the per-stream sc->tx_drain_pending flag. Use when
+        the producer observed the byte budget cleared between arm and
+        wait (the race-recovery branch of clear-arm-recheck-wait).
+        No-op on unknown stream_id."""
+        sc_ptr = self._stream_ctxs.get(stream_id, 0)
+        if not sc_ptr or self._transport is None:
+            return
+        self._transport.clear_stream_tx_drain_pending(sc_ptr)
+
+    def path_quality(self) -> dict:
+        """Snapshot of picoquic path-quality metrics for this cnx.
+
+        Returns a dict with cwnd (cwin), bytes_in_transit, smoothed
+        rtt, pacing_rate, lost packet counts, bytes sent/received.
+        The load-bearing CC + FC observability surface — use to
+        detect BBR freeze (cwin flat + bytes_in_transit pegged at
+        cwin for many RTT) or other CC pathologies without parsing
+        qlog.
+
+        Returns empty dict if the cnx is not yet open or the
+        transport is gone."""
+        if self._cnx_ptr == 0 or self._transport is None:
+            return {}
+        return self._transport.path_quality(self._cnx_ptr)
 
     def tx_pressure(self, stream_id: int = 0) -> float:
         """Current TX-ring fill ratio in [0.0, 1.0], for backpressure-
@@ -345,27 +426,6 @@ class QuicConnection:
         if not cap:
             return 0.0
         return self._transport.tx_count / cap
-
-    def tx_pending_bytes(self, stream_id: int = 0) -> int:
-        """Connection-global bytes pending in the SPSC TX event ring.
-
-        Returns the sum of data_length over events currently queued for
-        the picoquic worker. In the PULL model this is ~0 because
-        MARK_ACTIVE entries carry no payload — actual bytes live in
-        per-stream sc->tx rings. For per-stream sc->tx byte accounting
-        use _transport.stream_tx_buf_used(sc_ptr) directly with sc_ptr
-        from _stream_ctxs[stream_id].
-
-        stream_id arg kept for API stability but is currently unused:
-        the SPSC ring is connection-global. A per-stream variant was
-        explored and reverted — it mis-aligned the byte-budget threshold
-        check (which assumes sc->tx scope) with the ring_event wakeup
-        predicate (which fires on SPSC ring drain). Realigning needs a
-        dedicated per-stream wait predicate; deferred for redesign.
-        """
-        if self._transport is None:
-            return 0
-        return self._transport.tx_bytes_pending
 
     def next_event(self) -> QuicEvent | None:
         """Dequeue next event from the connection."""
@@ -414,7 +474,7 @@ class QuicConnection:
             # Wake parked drain waiters — see matching block ~line 256.
             for ev in self._stream_tx_drain_events.values():
                 ev.set()
-            ring_ev = getattr(self._transport, '_tx_ring_drain_event', None)
+            ring_ev = getattr(self._transport, '_tx_event_ring_drain_event', None)
             if ring_ev is not None:
                 ring_ev.set()
             self._destroy_stream_ctxs()
@@ -439,6 +499,9 @@ class QuicConnection:
                 event = asyncio.Event()
                 self._stream_tx_drain_events[stream_id] = event
             event.set()
+        elif evt_type == _EVT_STREAM_DESTROY:
+            self._stream_ctxs.pop(stream_id, None)
+            self._stream_tx_drain_events.pop(stream_id, None)
 
     def _get_or_create_stream_ctx(self, stream_id: int) -> int:
         """Lazy-allocate the per-stream wrapper. Both TX and RX paths
@@ -508,13 +571,13 @@ class QuicConnection:
         """Send with built-in TX-ring backpressure for raw QUIC.
 
         Composes send_stream_data + get_tx_drain_event + tx_pressure
-        and the connection-global tx_ring_drain_event so every caller
+        and the connection-global tx_event_ring_drain_event so every caller
         gets worker-thread-aware pacing without copying the heuristic.
         Mirrors aiopquic.asyncio.WebTransportSession.send_stream_data_drained.
 
         Layers:
           - hard ring-saturation guard: await the connection-global
-            tx_ring_drain_event when tx_pressure > hard_wait_at
+            tx_event_ring_drain_event when tx_pressure > hard_wait_at
             (default 0.9). Uses the clear-arm-recheck-wait pattern so
             there is no lost wakeup if the worker drains the ring
             between our threshold check and the wait.
@@ -527,20 +590,37 @@ class QuicConnection:
             on both wakes us on whichever fires.
 
         Application-level policies (byte budgets, fairness) belong
-        above this layer.
+        above this layer. The canonical per-stream byte-budget
+        primitive trio is:
+          - stream_tx_buf_used(stream_id) — data-ring queue depth
+            (where the payload actually lives in pull mode)
+          - arm_stream_tx_drain_pending(stream_id) — request a wake
+            on next sc->tx drain below sc->tx-full
+          - get_tx_drain_event(stream_id) — the per-stream wake
+        Pair these in a clear-arm-recheck-wait loop above the call
+        to this helper.
         """
         sc_event = self.get_tx_drain_event(stream_id)
-        ring_event = self._transport.tx_ring_drain_event
+        ring_event = self._transport.tx_event_ring_drain_event
         while True:
+            # Close-time guard: _EVT_CLOSE / _EVT_APP_CLOSE handlers
+            # set every per-stream event and the ring event explicitly
+            # to unpark waiters. Without this check the producer would
+            # observe set() events, fall through, call send_stream_data
+            # on a closed cnx, and propagate that failure into the
+            # caller. Return cleanly instead. STREAM_DESTROY also sets
+            # the per-stream event before popping it (see handler).
+            if self._closed:
+                return
             # Connection-global ring pressure: tx_pressure reads the
             # SPSC TX event ring. Wait on the connection-global ring
             # event, NOT the per-stream sc->tx event (which is only
             # armed when sc->tx fills).
             if self.tx_pressure(stream_id) > hard_wait_at:
                 ring_event.clear()
-                self._transport.arm_tx_ring_drain_pending()
+                self._transport.arm_tx_event_ring_drain_pending()
                 if self.tx_pressure(stream_id) <= hard_wait_at:
-                    self._transport.clear_tx_ring_drain_pending()
+                    self._transport.clear_tx_event_ring_drain_pending()
                     continue
                 await ring_event.wait()
                 continue
@@ -559,15 +639,25 @@ class QuicConnection:
             except BufferError:
                 # Cython side armed the appropriate signal:
                 # - sc->tx full → per-stream sc->tx_drain_pending
-                # - TX ring full → connection-global tx_ring_drain_pending
+                # - TX event ring full → connection-global tx_event_ring_drain_pending
                 # Events were cleared BEFORE the call so no lost wakeup.
                 sc_wait = asyncio.create_task(sc_event.wait())
                 ring_wait = asyncio.create_task(ring_event.wait())
                 done, pending = await asyncio.wait(
                     [sc_wait, ring_wait],
                     return_when=asyncio.FIRST_COMPLETED)
+                # Cancellation hygiene: await the cancelled task under
+                # suppress so the loop reaps it now instead of leaking
+                # a pending Task until the next scheduler turn (matters
+                # under teardown storms).
                 for t in pending:
                     t.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await t
+                # Re-check close after the wait — the close handler
+                # may have set our events to unpark us cleanly.
+                if self._closed:
+                    return
 
     def send_datagram_frame(self, data: bytes) -> None:
         """Send a datagram frame."""
