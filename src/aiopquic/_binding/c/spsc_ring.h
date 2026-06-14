@@ -128,6 +128,15 @@ typedef enum {
     SPSC_EVT_TX_OPEN_FLOW_CONTROL = 143,
     SPSC_EVT_TX_SET_APP_FLOW_CONTROL = 144,
 
+    /* WT session bulk-cleanup of per-stream wt_links — the splay-tree
+     * walk subset of TX_WT_DEREGISTER without the picowt_deregister +
+     * session_destroy steps. Used by SESSION_CLOSED handler to reap
+     * orphan wt_link sc's when the cnx is stalled (BBR freeze, cwin
+     * pinned post-disconnect, etc.) and per-sid RESETs can't get on
+     * the wire. The session object survives so the Python wrapper's
+     * __dealloc__ can later push TX_WT_DEREGISTER for full teardown. */
+    SPSC_EVT_TX_WT_SESSION_CLEANUP = 145,
+
     /* WebTransport (H3) — picoquic thread → asyncio thread. The
      * `cnx` field carries the picoquic_cnx_t*; `stream_id` is the
      * WT control stream for session events, or the WT stream for
@@ -299,7 +308,7 @@ static inline int spsc_ring_push(spsc_ring_t* ring, const spsc_entry_t* entry,
 /*
  * Push with a BORROWED data_buf pointer (no malloc, no memcpy). The
  * caller-supplied entry.data_buf is preserved as-is in the ring slot.
- * Used by Phase B WT path where the entry carries a pointer to a
+ * Used by the WT path where the entry carries a pointer to a
  * per-stream aiopquic_stream_ctx_t whose lifetime exceeds the ring
  * entry's. Consumer MUST NOT call spsc_ring_pop without first zeroing
  * the borrowed pointer, OR data_length must be 0 (the convention spsc_
@@ -360,7 +369,7 @@ static inline void spsc_ring_pop(spsc_ring_t* ring) {
     uint64_t head = atomic_load_explicit(&ring->head, memory_order_relaxed);
     spsc_entry_t* e = &ring->entries[head & ring->mask];
     /* Free only when the buffer was malloc'd by spsc_ring_push (which
-     * sets data_length > 0). Phase B WT borrowed pointers carry
+     * sets data_length > 0). WT borrowed pointers carry
      * data_length=0 — the per-stream aiopquic_stream_ctx_t in
      * data_buf is owned by the WT session, not the ring entry, and
      * must outlive the entry. */

@@ -35,15 +35,15 @@
 
 /* Per-stream RX byte ring fallback. 4 MB covers 1 Gbps × 32 ms or
  * 2.5 Gbps × 13 ms cleanly. For 2.5 Gbps × 100 ms WAN set ~32 MB via
- * QuicConfiguration.rx_ring_cap; for 10 Gbps × 100 ms set ~128 MB.
+ * QuicConfiguration.rx_data_ring_cap; for 10 Gbps × 100 ms set ~128 MB.
  * Memory cost scales with concurrent stream count. Power of two. */
-#define AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT (1u << 22)
+#define AIOPQUIC_RX_DATA_RING_CAP_DEFAULT (1u << 22)
 
 /* Per-stream TX byte ring fallback. Holds bytes between Python's
  * send_stream_data and picoquic's worker drain. Doesn't need to
  * be BDP-sized (picoquic drains continuously); 4 MB matches RX
  * for symmetry and gives ample staging headroom. */
-#define AIOPQUIC_TX_STREAM_RING_CAP_DEFAULT (1u << 22)
+#define AIOPQUIC_TX_DATA_RING_CAP_DEFAULT (1u << 22)
 
 /* Legacy shared SPSC ring default — preserved for backward-compat
  * callers (Python QuicConfiguration.event_ring_capacity fallback).
@@ -59,7 +59,7 @@
  * large enough to absorb command bursts without starving the data
  * path. Drainage threshold controlled by AIOPQUIC_TX_RING_WAKE_PCT.
  * Power of two. */
-#define AIOPQUIC_TX_RING_CAP_DEFAULT 2048
+#define AIOPQUIC_TX_EVENT_RING_CAP_DEFAULT 2048
 
 /* RX SPSC event ring default. Carries worker→asyncio notifications:
  * stream_data / stream_fin / stream_open / connection events + the
@@ -70,13 +70,7 @@
  * 16384 entries chosen as the floor at which sustained MoQT
  * subgroup churn at multi-Gbps stops triggering drops in lab.
  * Power of two. */
-#define AIOPQUIC_RX_RING_CAP_DEFAULT 16384
-
-/* MAX_STREAM_DATA hysteresis: advance peer credit when ≥ 1/4 of
- * the ring has been drained since the last update. Matches
- * picoquic's own receive_window_threshold cadence and bounds the
- * rate of MAX_STREAM_DATA frames under sustained drain. */
-#define AIOPQUIC_RX_FC_THRESHOLD_DIV 4
+#define AIOPQUIC_RX_EVENT_RING_CAP_DEFAULT 16384
 
 /* TX SPSC ring drain-wake low-water mark, as percent of ring
  * capacity. Worker fires SPSC_EVT_TX_EVENT_RING_DRAINED when count
@@ -100,7 +94,7 @@
  * deref into a freed cnx is a UAF, surfacing as a NULL-page fault
  * inside picoquic when a struct field is loaded.
  *
- * TODO(0.3.5+): replace with a generation-counter lookup if aiomoqt
+ * TODO: replace with a generation-counter lookup if aiomoqt
  * grows into a relay role with many concurrent cnxs. For the
  * current publisher/client shape (1–2 cnxs) the walk is one or two
  * pointer compares per event — effectively free. Cost scales O(N)
@@ -203,7 +197,7 @@ typedef struct {
      * never sends more before MAX_STREAM_DATA is extended). Rounded
      * up to a power of two by the Cython binding before being stored
      * here. */
-    uint32_t        rx_ring_cap;
+    uint32_t        rx_data_ring_cap;
     /* Forensic counters — incremented from the picoquic worker thread
      * as it processes TX events. The asyncio thread reads them via
      * Cython properties to verify per-event accounting. Plain ints,
@@ -218,6 +212,7 @@ typedef struct {
      * are silently lost. THIS WAS THE STREAM-LOSS BUG ROOT CAUSE. */
     uint64_t        worker_rx_event_drops;
     uint64_t        worker_rx_event_drops_stream_data;
+    uint64_t        cnt_rx_data_event_coalesced;     /* data events skipped: notification already in flight */
     /* Notify-coalescing state. eventfd is level-triggered; multiple
      * write()s coalesce to one wake-up at the consumer, but each
      * write is still a syscall. At 250K events/sec on a stream-churn
@@ -300,6 +295,13 @@ typedef struct {
     uint64_t        cnt_sc_destroy_wt_link_close_walker;  /* via session-close walker sweep */
     uint64_t        cnt_sc_destroy_fc_credit_pushfail; /* callback.h ~464 push-fail unref */
     uint64_t        cnt_sc_destroy_fc_credit_worker;   /* callback.h ~1114 worker unref */
+    /* QUIC keep-alive interval (microseconds). 0 = disabled. Applied
+     * per-cnx by the worker thread at the ready callback via
+     * picoquic_enable_keep_alive — PING frames hold an otherwise-quiet
+     * connection open past the idle timeout (e.g. a consumer-stalled
+     * subscriber whose flow control has back-pressured the sender to
+     * silence). Set once at start(); read by the worker. */
+    uint64_t        keep_alive_us;
 } aiopquic_ctx_t;
 
 /* aiopquic_now_ns() is defined in stream_ctx.h (included above). */
@@ -307,14 +309,14 @@ typedef struct {
 /* Create a TransportContext with independent TX and RX SPSC ring
  * sizes and an explicit drain-wake low-water percent. Pass 0 for
  * any of the three to take the compile-time default
- * (AIOPQUIC_TX_RING_CAP_DEFAULT / AIOPQUIC_RX_RING_CAP_DEFAULT /
+ * (AIOPQUIC_TX_EVENT_RING_CAP_DEFAULT / AIOPQUIC_RX_EVENT_RING_CAP_DEFAULT /
  * AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT). Ring caps must be powers of
  * two — the caller (Cython binding) is responsible for rounding. */
 static inline aiopquic_ctx_t* aiopquic_ctx_create(uint32_t tx_cap,
                                                    uint32_t rx_cap,
                                                    uint32_t low_water_pct) {
-    if (tx_cap == 0) tx_cap = AIOPQUIC_TX_RING_CAP_DEFAULT;
-    if (rx_cap == 0) rx_cap = AIOPQUIC_RX_RING_CAP_DEFAULT;
+    if (tx_cap == 0) tx_cap = AIOPQUIC_TX_EVENT_RING_CAP_DEFAULT;
+    if (rx_cap == 0) rx_cap = AIOPQUIC_RX_EVENT_RING_CAP_DEFAULT;
     if (low_water_pct == 0 || low_water_pct >= 100) {
         low_water_pct = AIOPQUIC_TX_RING_WAKE_PCT_DEFAULT;
     }
@@ -667,6 +669,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             if (buf && to_send > 0) {
                 aiopquic_stream_buf_pop(sb, buf, to_send);
                 ctx->worker_prepare_to_send_pulled_bytes += to_send;
+                aiopquic_tx_data_bytes_pulled_add(to_send);
             } else {
                 /* prepare_to_send invoked with no bytes to pull —
                  * either sc->tx empty (worker faster than producer)
@@ -755,6 +758,15 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         return 0;
     }
 
+    if (fin_or_event == picoquic_callback_ready
+            && ctx->keep_alive_us > 0) {
+        /* Enable keep-alive once the cnx is ready (worker thread owns
+         * the cnx here). PING frames keep a quiet connection alive past
+         * the idle timeout — important for a flow-controlled subscriber
+         * whose consumer stalled and back-pressured the sender silent. */
+        picoquic_enable_keep_alive(cnx, ctx->keep_alive_us);
+    }
+
     int evt = aiopquic_map_event(fin_or_event);
     if (evt < 0) {
         return 0;
@@ -794,6 +806,7 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
                        fin_or_event == picoquic_callback_stream_fin)
                       && bytes != NULL && length > 0;
     int ret;
+    aiopquic_stream_ctx_t* coalesce_sc = NULL;
     if (has_payload) {
         /* Physical RX ring sized at exactly the advertised window
          * (1x). picoquic's auto-FC extension is gated by
@@ -808,11 +821,10 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
          * memory traffic + cache footprint per stream. RX ring
          * overflow remains a hard error: a peer that overruns is a
          * spec-correct FLOW_CONTROL_ERROR connection close. */
-        uint32_t advertise_cap = ctx->rx_ring_cap > 0
-            ? ctx->rx_ring_cap
-            : AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT;
+        uint32_t advertise_cap = ctx->rx_data_ring_cap > 0
+            ? ctx->rx_data_ring_cap
+            : AIOPQUIC_RX_DATA_RING_CAP_DEFAULT;
         uint32_t physical_cap = advertise_cap;
-        uint32_t fc_threshold = advertise_cap / AIOPQUIC_RX_FC_THRESHOLD_DIV;
         aiopquic_stream_ctx_t* sc = (aiopquic_stream_ctx_t*)stream_ctx;
         int rx_first_touch = 0;
         if (!sc) {
@@ -874,7 +886,22 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
             (void)picoquic_open_flow_control(cnx, stream_id, buf_free);
             aiopquic_stream_ctx_rx_credit_store(sc, advertise_cap);
         }
-        (void)fc_threshold;
+        /* RX data-event coalescing: at most ONE outstanding STREAM_DATA
+         * notification per stream. The event carries no payload —
+         * drain pops ALL available sc->rx bytes per notification — so
+         * extra notifications are pure ring traffic that, under flood,
+         * overflow the ring and get DROPPED, stranding bytes already
+         * sitting in sc->rx. Only the CAS winner pushes; losers
+         * return knowing the in-flight notification's drain picks up
+         * their bytes. FIN always pushes — end-of-stream is a
+         * distinct signal the drain must see. */
+        if (entry.event_type == SPSC_EVT_STREAM_DATA) {
+            if (!aiopquic_stream_ctx_rx_event_pending_arm(sc)) {
+                ctx->cnt_rx_data_event_coalesced++;
+                return 0;
+            }
+            coalesce_sc = sc;
+        }
         ret = spsc_ring_push(ctx->rx_event_ring, &entry, NULL, 0);
     } else {
         ret = spsc_ring_push(ctx->rx_event_ring, &entry, bytes, (uint32_t)length);
@@ -899,6 +926,14 @@ static int aiopquic_stream_cb(picoquic_cnx_t* cnx,
         ctx->worker_rx_event_drops++;
         if (has_payload) {
             ctx->worker_rx_event_drops_stream_data++;
+        }
+        if (coalesce_sc != NULL) {
+            /* Notification push failed after arming: clear so the next
+             * arrival re-arms and retries; bytes wait in sc->rx
+             * meanwhile (same exposure as the pre-coalescing drop
+             * path, now vastly rarer since data events can no
+             * longer flood the ring). */
+            aiopquic_stream_ctx_rx_event_pending_clear(coalesce_sc);
         }
         if (aiopquic_rx_log_enabled()
                 && ctx->worker_rx_event_drops <= 100) {

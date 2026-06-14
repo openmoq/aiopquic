@@ -10,7 +10,7 @@ Three classes:
   WebTransportClient(...)  — initiator subclass; adds open(). Used by
                               connect_webtransport(host, port, path).
 
-  WebTransportServerSession(...) — acceptor subclass (Phase C.4 step 2/3);
+  WebTransportServerSession(...) — acceptor subclass;
                               constructed from an incoming H3 CONNECT.
 
 The cdef class WebTransportSessionState (in _binding._transport) is the
@@ -26,8 +26,10 @@ from collections import deque
 from contextlib import asynccontextmanager, suppress
 from typing import AsyncGenerator
 
+from aiopquic.quic.configuration import QuicConfiguration
 from aiopquic._binding._transport import (
     TransportContext, WebTransportSessionState,
+    tx_data_bytes_queued,
 )
 from aiopquic.quic.events import (
     WebTransportSessionRefused,
@@ -58,6 +60,10 @@ _EVT_WT_DATAGRAM = 72
 _EVT_WT_NEW_STREAM = 73
 _EVT_WT_STREAM_CREATED = 74
 _EVT_WT_NEW_SESSION = 75
+
+# Application-error code surfaced on RESET_STREAM for WT data streams when
+# the WT session itself terminates. Per draft-ietf-webtrans-http3 §6, §9.5.
+WT_SESSION_GONE = 0x170d7b68
 
 
 class WebTransportError(Exception):
@@ -110,7 +116,7 @@ class WebTransportSession:
         # Per-stream drain events. Set by _on_event when the picoquic
         # worker fires SPSC_EVT_STREAM_TX_DRAINED for a stream; awaited
         # by send_stream_data_drained / external callers via
-        # get_tx_drain_event. Lazy-allocated per stream_id.
+        # get_tx_data_drain_event. Lazy-allocated per stream_id.
         self._stream_tx_drain_events: dict[int, asyncio.Event] = {}
         # Per-stream sc pointers (uintptr_t) the C side surfaces via
         # NEW_STREAM (peer-initiated) and STREAM_CREATED (we initiated).
@@ -158,6 +164,15 @@ class WebTransportSession:
 
     @property
     def cnx_ptr(self) -> int:
+        # Returns 0 once SESSION_CLOSED has been observed so the
+        # dump_all_counters harvest sees a sentinel rather than the
+        # dangling C ptr — picoquic may have already freed the cnx by
+        # this point. Residual race: picoquic_delete_cnx returns
+        # (freed) before this asyncio handler runs (gap = SPSC drain
+        # latency, microseconds). Vastly narrower than the prior
+        # "freed seconds ago" UAF in dump_all_counters.
+        if self._session_closed.is_set():
+            return 0
         return self._state.cnx_ptr
 
     # --- dispatcher attach (called by subclass setup paths) -----------
@@ -175,6 +190,36 @@ class WebTransportSession:
 
     # --- stream management --------------------------------------------
 
+    # Aggregate TX gate budget (QuicConfiguration.tx_max_queued_bytes).
+    # Class default matches the configuration default; instance attr
+    # set by connect_webtransport / serve_webtransport when a
+    # configuration is supplied. None/0 disables the gate.
+    tx_max_queued_bytes: int | None = 4 * 1024 * 1024
+    # Per-stream sc->tx ring cap forwarded to push_stream_data
+    # (QuicConfiguration.stream_ring_cap). Class default matches the
+    # C compile-time default; instance attr set by the entry points
+    # when a configuration is supplied.
+    stream_ring_cap: int = 4 * 1024 * 1024
+
+    async def _await_tx_data_capacity(self) -> None:
+        """Park while aggregate TX-queued bytes exceed the budget.
+
+        The green-light is connection-drain capacity (any stream's
+        drain frees budget), not any single stream's state — one
+        wedged stream costs at most its own queued bytes against the
+        budget and can never stall the gate by itself. Hysteresis:
+        park above cap, resume below cap/2. 2 ms poll on three
+        relaxed atomic loads; the producer is far ahead of the wire
+        whenever this engages, so poll granularity is immaterial.
+        Session close exits the park (queued also drains to the
+        discarded sink as streams tear down)."""
+        cap = self.tx_max_queued_bytes
+        if not cap or tx_data_bytes_queued() <= cap:
+            return
+        low = cap // 2
+        while not self.session_closed and tx_data_bytes_queued() > low:
+            await asyncio.sleep(0.002)
+
     async def create_stream(self, bidir: bool = True,
                               timeout: float = 5.0) -> int:
         """Open a new WT stream. Returns the assigned stream_id.
@@ -182,9 +227,18 @@ class WebTransportSession:
         Round-trips to the picoquic thread because picowt allocates
         the id internally. Multiple concurrent callers are safe:
         each appends a future to a FIFO and picoquic responds in
-        the same order TX events were pushed."""
+        the same order TX events were pushed.
+
+        Parks first while the aggregate TX-queued budget is exceeded
+        (_await_tx_data_capacity) — the stream-creation boundary is
+        the one point short-stream churn cannot bypass."""
+        if self.session_closed:
+            raise WebTransportError("WT session closed")
         if not self.session_ready:
             raise WebTransportError("session not ready")
+        await self._await_tx_data_capacity()
+        if self.session_closed:
+            raise WebTransportError("WT session closed")
         fut = self._loop.create_future()
         self._pending_creates.append(fut)
         self._state.push_create_stream(bidir)
@@ -216,13 +270,14 @@ class WebTransportSession:
             raise WebTransportError(
                 f"WT stream {stream_id} not available "
                 "(never opened, closed, or reset)")
-        self._state.push_stream_data(stream_id, sc_ptr, data, end_stream)
+        self._state.push_stream_data(stream_id, sc_ptr, data, end_stream,
+                                     stream_ring_cap=self.stream_ring_cap)
 
-    def get_tx_drain_event(self, stream_id: int) -> asyncio.Event:
+    def get_tx_data_drain_event(self, stream_id: int) -> asyncio.Event:
         """asyncio.Event signalled when the picoquic worker drains
         bytes from this stream's sc->tx after the ring was reported
         full. Caller pattern:
-            event = wt.get_tx_drain_event(sid)
+            event = wt.get_tx_data_drain_event(sid)
             event.clear()
             try:
                 wt.send_stream_data(sid, data, end_stream)
@@ -236,14 +291,14 @@ class WebTransportSession:
             self._stream_tx_drain_events[stream_id] = event
         return event
 
-    def stream_tx_buf_used(self, stream_id: int) -> int:
+    def tx_data_ring_used(self, stream_id: int) -> int:
         """Per-stream sc->tx bytes-in-flight — the load-bearing
         backpressure signal in the pull model.
 
         Returns the count of bytes currently queued in this WT
         stream's sc->tx ring waiting for the picoquic worker to pull
-        them onto the wire. Companion of arm_stream_tx_drain_pending +
-        get_tx_drain_event: read used → if over budget, arm the
+        them onto the wire. Companion of set_tx_data_drain_pending +
+        get_tx_data_drain_event: read used → if over budget, arm the
         per-stream drain-pending flag and await the per-stream event.
         Unknown stream_id returns 0.
 
@@ -260,21 +315,21 @@ class WebTransportSession:
         sc_ptr = self._stream_tx_ctxs.get(stream_id, 0)
         if not sc_ptr:
             return 0
-        return self._transport.stream_tx_buf_used(sc_ptr)
+        return self._transport.tx_data_ring_used(sc_ptr)
 
-    def arm_stream_tx_drain_pending(self, stream_id: int) -> None:
+    def set_tx_data_drain_pending(self, stream_id: int) -> None:
         """Arm the per-stream sc->tx_drain_pending flag so the next
         worker drain of this stream's sc->tx fires
         SPSC_EVT_STREAM_TX_DRAINED — even if sc->tx wasn't full.
-        Pair with get_tx_drain_event(stream_id) for the canonical
+        Pair with get_tx_data_drain_event(stream_id) for the canonical
         clear-arm-recheck-wait pattern against a byte budget below
         sc->tx full. No-op on unknown stream_id."""
         sc_ptr = self._stream_tx_ctxs.get(stream_id, 0)
         if not sc_ptr:
             return
-        self._transport.arm_stream_tx_drain_pending(sc_ptr)
+        self._transport.set_tx_data_drain_pending(sc_ptr)
 
-    def clear_stream_tx_drain_pending(self, stream_id: int) -> None:
+    def clear_tx_data_drain_pending(self, stream_id: int) -> None:
         """Clear the per-stream sc->tx_drain_pending flag. Use when
         the producer observed the byte budget cleared between arm and
         wait (the race-recovery branch of clear-arm-recheck-wait).
@@ -282,7 +337,7 @@ class WebTransportSession:
         sc_ptr = self._stream_tx_ctxs.get(stream_id, 0)
         if not sc_ptr:
             return
-        self._transport.clear_stream_tx_drain_pending(sc_ptr)
+        self._transport.clear_tx_data_drain_pending(sc_ptr)
 
     def path_quality(self) -> dict:
         """Snapshot of picoquic path-quality metrics for the underlying
@@ -297,18 +352,17 @@ class WebTransportSession:
             return {}
         return self._transport.path_quality(cnx_ptr)
 
-    def tx_pressure(self, stream_id: int = 0) -> float:
-        """TX-ring fill ratio in [0.0, 1.0], for backpressure-aware
-        yielding from tight send loops. BufferError from
-        send_stream_data is the hard signal; this is the soft
-        companion. `stream_id` is reserved for future per-stream ring
-        accounting; the SPSC TX ring is shared across all WT streams
-        on this session today so the value is connection-global.
+    def tx_event_ring_fill(self) -> float:
+        """TX event-ring fill ratio in [0.0, 1.0], connection-global
+        (the SPSC TX ring is shared across all WT streams on this
+        session). BufferError from send_stream_data is the hard
+        backpressure signal; this is the soft companion for
+        yield-threshold decisions in tight send loops.
         """
-        cap = self._transport.tx_capacity
+        cap = self._transport.tx_event_ring_capacity
         if not cap:
             return 0.0
-        return self._transport.tx_count / cap
+        return self._transport.tx_event_ring_count / cap
 
     async def send_stream_data_drained(self, stream_id: int, data: bytes,
                                          end_stream: bool = False,
@@ -317,19 +371,19 @@ class WebTransportSession:
                                          hard_wait_at: float = 0.9) -> None:
         """Send with built-in TX-ring backpressure for WT.
 
-        Composes send_stream_data + get_tx_drain_event + tx_pressure so
+        Composes send_stream_data + get_tx_data_drain_event + tx_event_ring_fill so
         every WT caller gets worker-thread-aware pacing without copying
         the heuristic. Mirrors aiopquic.QuicConnection.send_stream_data_drained.
 
         Layers:
           - hard ring-saturation guard: await the connection-global
-            tx_event_ring_drain_event when `tx_pressure > hard_wait_at`
+            tx_event_ring_drain_event when `tx_event_ring_fill > hard_wait_at`
             (default 0.9). Uses the clear-arm-recheck-wait pattern so
             there is no lost wakeup if the worker drains the ring
             between our threshold check and the wait.
           - send: atomic push to sc->tx + MARK_ACTIVE under one GIL hold.
           - soft post-send yield: `await asyncio.sleep(0)` when
-            `tx_pressure > soft_yield_at` (default 0.5).
+            `tx_event_ring_fill > soft_yield_at` (default 0.5).
           - BufferError retry: await whichever drain event the Cython
             side armed (sc->tx-full arms per-stream event; TX-ring-full
             arms connection-global event). asyncio.wait FIRST_COMPLETED
@@ -338,15 +392,15 @@ class WebTransportSession:
         Application-level policies (byte budgets, fairness) belong
         above this layer. The canonical per-stream byte-budget
         primitive trio is:
-          - stream_tx_buf_used(stream_id) — data-ring queue depth
+          - tx_data_ring_used(stream_id) — data-ring queue depth
             (where the payload actually lives in pull mode)
-          - arm_stream_tx_drain_pending(stream_id) — request a wake
+          - set_tx_data_drain_pending(stream_id) — request a wake
             on next sc->tx drain below sc->tx-full
-          - get_tx_drain_event(stream_id) — the per-stream wake
+          - get_tx_data_drain_event(stream_id) — the per-stream wake
         Pair these in a clear-arm-recheck-wait loop above the call
         to this helper.
         """
-        sc_event = self.get_tx_drain_event(stream_id)
+        sc_event = self.get_tx_data_drain_event(stream_id)
         ring_event = self._transport.tx_event_ring_drain_event
         while True:
             # Close-time guard: SESSION_CLOSED / per-stream-terminal
@@ -357,14 +411,14 @@ class WebTransportSession:
             # caller. Return cleanly instead.
             if self.session_closed:
                 return
-            # Connection-global ring pressure: tx_pressure reads the
+            # Connection-global ring pressure: tx_event_ring_fill reads the
             # SPSC TX event ring. Wait on the connection-global ring
             # event, NOT the per-stream sc->tx event (which is only
             # armed when sc->tx fills).
-            if self.tx_pressure(stream_id) > hard_wait_at:
+            if self.tx_event_ring_fill() > hard_wait_at:
                 ring_event.clear()
                 self._transport.arm_tx_event_ring_drain_pending()
-                if self.tx_pressure(stream_id) <= hard_wait_at:
+                if self.tx_event_ring_fill() <= hard_wait_at:
                     # Raced — worker drained between checks.
                     self._transport.clear_tx_event_ring_drain_pending()
                     continue
@@ -380,7 +434,7 @@ class WebTransportSession:
             try:
                 self.send_stream_data(stream_id, data,
                                        end_stream=end_stream)
-                if self.tx_pressure(stream_id) > soft_yield_at:
+                if self.tx_event_ring_fill() > soft_yield_at:
                     await asyncio.sleep(0)
                 return
             except BufferError:
@@ -484,68 +538,9 @@ class WebTransportSession:
                     cnx_ptr, stream_ctx_ptr, sc_ptr)."""
         evt_type, sid, data, _is_fin, error_code, _cnx_ptr, _, sc_ptr = (
             ev_tuple)
-        if evt_type == _EVT_WT_SESSION_READY:
-            if self._session_ready and not self._session_ready.done():
-                self._session_ready.set_result(None)
-        elif evt_type == _EVT_WT_SESSION_REFUSED:
-            err = WebTransportSessionRefused(error_code=error_code)
-            if self._session_ready and not self._session_ready.done():
-                self._session_ready.set_exception(WebTransportError(
-                    f"WT CONNECT refused (code={error_code})"))
-            self._event_queue.put_nowait(err)
-        elif evt_type == _EVT_WT_SESSION_CLOSED:
-            reason = data if data is not None else memoryview(b"")
-            ev = WebTransportSessionClosed(error_code=error_code,
-                                              reason=reason)
-            self._session_close_event = ev
-            self._session_closed.set()
-            if (self._session_ready
-                    and not self._session_ready.done()):
-                self._session_ready.set_exception(WebTransportError(
-                    "WT session closed before READY"))
-            # Fail any pending create_stream() callers; the session
-            # is gone, no point making them wait for the timeout.
-            while self._pending_creates:
-                fut = self._pending_creates.popleft()
-                if not fut.done():
-                    fut.set_exception(WebTransportError(
-                        "WT session closed"))
-            # All borrowed sc pointers are invalidated by session close
-            # (the C side will free links via LINK_RELEASE events as
-            # picoquic retires the cnx). Drop our references now so
-            # send_stream_data raises cleanly rather than handing a
-            # soon-to-be-freed pointer back into Cython.
-            self._stream_tx_ctxs.clear()
-            # Wake any producer parked in send_stream_data_drained
-            # awaiting per-stream sc_event or connection-global
-            # ring_event. After close the worker stops invoking drain
-            # callbacks for this session's streams, so without these
-            # explicit sets the waiter would deadlock until process
-            # exit. Producer wakes, loops, observes session_closed
-            # and raises / returns cleanly.
-            for tx_ev in self._stream_tx_drain_events.values():
-                tx_ev.set()
-            ring_ev = getattr(self._transport,
-                                '_tx_event_ring_drain_event', None)
-            if ring_ev is not None:
-                ring_ev.set()
-            self._event_queue.put_nowait(ev)
-        elif evt_type == _EVT_WT_SESSION_DRAINING:
-            self._draining = True
-            self._event_queue.put_nowait(WebTransportSessionDraining())
-        elif evt_type == _EVT_WT_STREAM_CREATED:
-            # Stash the sc pointer the C side allocated for this
-            # outbound stream so send_stream_data has it on first use.
-            if sc_ptr and error_code == 0:
-                self._stream_tx_ctxs[sid] = sc_ptr
-            # Pair with the oldest pending create_stream() caller.
-            # Skip already-cancelled futures (caller timed out / closed).
-            while self._pending_creates:
-                fut = self._pending_creates.popleft()
-                if not fut.done():
-                    fut.set_result(0 if error_code != 0 else sid)
-                    break
-        elif evt_type == _EVT_WT_STREAM_DATA:
+        # Hot branches first: data, FIN, and TX-drain wakes dominate
+        # the event stream; session-lifecycle events are rare.
+        if evt_type == _EVT_WT_STREAM_DATA:
             payload = data if data is not None else memoryview(b"")
             ev = WebTransportStreamDataReceived(
                 stream_id=sid, data=payload, end_stream=False)
@@ -564,6 +559,106 @@ class WebTransportSession:
             # Peer FINed the stream — no further reads, but we may
             # still be writing on a bidi until our own FIN goes out.
             # Don't drop tx_ctx here; that's owned by the writer side.
+        elif evt_type == _EVT_STREAM_TX_DRAINED:
+            # Picoquic worker drained bytes from this stream's sc->tx
+            # and the edge-trigger CAS won. Wake any blocked writer.
+            event = self._stream_tx_drain_events.get(sid)
+            if event is None:
+                event = asyncio.Event()
+                self._stream_tx_drain_events[sid] = event
+            event.set()
+        elif evt_type == _EVT_WT_SESSION_READY:
+            if self._session_ready and not self._session_ready.done():
+                self._session_ready.set_result(None)
+        elif evt_type == _EVT_WT_SESSION_REFUSED:
+            err = WebTransportSessionRefused(error_code=error_code)
+            if self._session_ready and not self._session_ready.done():
+                self._session_ready.set_exception(WebTransportError(
+                    f"WT CONNECT refused (code={error_code})"))
+            self._event_queue.put_nowait(err)
+        elif evt_type == _EVT_WT_SESSION_CLOSED:
+            reason = data if data is not None else memoryview(b"")
+            ev = WebTransportSessionClosed(error_code=error_code, reason=reason)
+            self._session_close_event = ev
+            self._session_closed.set()
+            if (self._session_ready
+                    and not self._session_ready.done()):
+                self._session_ready.set_exception(WebTransportError(
+                    "WT session closed before READY"))
+            # Fail any pending create_stream() callers; the session
+            # is gone, no point making them wait for the timeout.
+            while self._pending_creates:
+                fut = self._pending_creates.popleft()
+                if not fut.done():
+                    fut.set_exception(WebTransportError(
+                        "WT session closed"))
+            # Bulk-free this session's wt_link sc's via a single
+            # worker-thread splay-tree walk (TX_WT_SESSION_CLEANUP).
+            # Worker-local; no wire frames, so it succeeds even when
+            # the cnx is stalled (cwin pinned post-disconnect, BBR
+            # #2118, etc.) and per-sid RESETs can't be transmitted.
+            # O(1) ring cost — does not depend on stream count.
+            try:
+                self._state.push_session_cleanup()
+            except BufferError:
+                pass
+            self._stream_tx_ctxs.clear()
+            # Wake any producer parked in send_stream_data_drained
+            # awaiting per-stream sc_event or connection-global
+            # ring_event. After close the worker stops invoking drain
+            # callbacks for this session's streams, so without these
+            # explicit sets the waiter would deadlock until process
+            # exit. Producer wakes, loops, observes session_closed
+            # and raises / returns cleanly.
+            for tx_ev in self._stream_tx_drain_events.values():
+                tx_ev.set()
+            ring_ev = getattr(self._transport,
+                                '_tx_event_ring_drain_event', None)
+            if ring_ev is not None:
+                ring_ev.set()
+            # Stream-inbox queues are only popped on per-stream
+            # STREAM_DESTROY; without an explicit reclaim here, every
+            # WT data stream that arrived and was fully drained leaks
+            # its asyncio.Queue (plus any undrained payloads pinning
+            # Cython chunk buffers) for the lifetime of this session
+            # object. Drain each queue to release pinned chunks, then
+            # clear the dict.
+            for q in self._stream_inbox.values():
+                while True:
+                    try:
+                        q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+            self._stream_inbox.clear()
+            self._event_queue.put_nowait(ev)
+        elif evt_type == _EVT_WT_SESSION_DRAINING:
+            self._draining = True
+            self._event_queue.put_nowait(WebTransportSessionDraining())
+        elif evt_type == _EVT_WT_STREAM_CREATED:
+            # Race tail: SESSION_CLOSED may have been processed before
+            # the worker finished allocating this stream. In that case
+            # the corresponding pending_create future is already errored
+            # and _stream_tx_ctxs was cleared; stashing sc_ptr would
+            # orphan it. Push a reset so picoquic retires the stream
+            # and the callback chain frees the link.
+            if self._session_closed.is_set():
+                if sc_ptr and error_code == 0 and sid:
+                    try:
+                        self._state.push_reset_stream(sid, WT_SESSION_GONE)
+                    except BufferError:
+                        pass
+                return
+            # Stash the sc pointer the C side allocated for this
+            # outbound stream so send_stream_data has it on first use.
+            if sc_ptr and error_code == 0:
+                self._stream_tx_ctxs[sid] = sc_ptr
+            # Pair with the oldest pending create_stream() caller.
+            # Skip already-cancelled futures (caller timed out / closed).
+            while self._pending_creates:
+                fut = self._pending_creates.popleft()
+                if not fut.done():
+                    fut.set_result(0 if error_code != 0 else sid)
+                    break
         elif evt_type == _EVT_WT_STREAM_RESET:
             ev = WebTransportStreamReset(stream_id=sid,
                                             error_code=error_code)
@@ -584,20 +679,24 @@ class WebTransportSession:
             self._event_queue.put_nowait(
                 WebTransportDatagramReceived(data=payload))
         elif evt_type == _EVT_WT_NEW_STREAM:
+            # Mirror of the _EVT_WT_STREAM_CREATED race: SESSION_CLOSED
+            # may have been processed before this peer-initiated NEW
+            # event arrived. Without a guard, sc_ptr would be re-stashed
+            # into the cleared _stream_tx_ctxs and a NewStream event
+            # delivered to an application that no longer has a session.
+            if self._session_closed.is_set():
+                if sc_ptr and sid:
+                    try:
+                        self._state.push_reset_stream(sid, WT_SESSION_GONE)
+                    except BufferError:
+                        pass
+                return
             # Peer opened a new stream — for bidi we may want to reply,
             # so stash the sc pointer here too.
             if sc_ptr:
                 self._stream_tx_ctxs[sid] = sc_ptr
             self._event_queue.put_nowait(
                 WebTransportNewStream(stream_id=sid))
-        elif evt_type == _EVT_STREAM_TX_DRAINED:
-            # Picoquic worker drained bytes from this stream's sc->tx
-            # and the edge-trigger CAS won. Wake any blocked writer.
-            event = self._stream_tx_drain_events.get(sid)
-            if event is None:
-                event = asyncio.Event()
-                self._stream_tx_drain_events[sid] = event
-            event.set()
         elif evt_type == _EVT_STREAM_DESTROY:
             # Universal raw-QUIC STREAM_DESTROY — fired for raw-QUIC
             # streams that share this transport. WT data streams use
@@ -671,8 +770,8 @@ class WebTransportClient(WebTransportSession):
 
 
 # =====================================================================
-# Acceptor-side: subclass added in Phase C.4 step 3 (server-side
-# bridge in C must surface WT_NEW_SESSION events first).
+# Acceptor-side subclass: the C bridge surfaces WT_NEW_SESSION
+# events that construct these.
 # =====================================================================
 
 class WebTransportServerSession(WebTransportSession):
@@ -742,8 +841,7 @@ class _Dispatcher:
         stream_ctx_ptr = ev[6]
         if stream_ctx_ptr in self._sessions:
             return  # already attached (re-entrancy guard)
-        state = WebTransportSessionState(self._transport,
-                                          session_ptr=stream_ctx_ptr)
+        state = WebTransportSessionState(self._transport, session_ptr=stream_ctx_ptr)
         factory = getattr(self, '_session_factory', None)
         if factory is None:
             session = WebTransportServerSession(self._transport, state)
@@ -824,6 +922,7 @@ async def connect_webtransport(
         wt_available_protocols: list[str] | None = None,
         transport: TransportContext | None = None,
         timeout: float = 10.0,
+        configuration: QuicConfiguration | None = None,
 ) -> AsyncGenerator[WebTransportClient, None]:
     """Open a WebTransport session.
 
@@ -847,12 +946,40 @@ async def connect_webtransport(
         path = "/"
     own_transport = transport is None
     if own_transport:
-        transport = TransportContext()
-        transport.start(is_client=True, alpn="h3",
-                          max_datagram_frame_size=64 * 1024)
+        if (configuration is not None
+                and configuration.event_ring_capacity is not None):
+            transport = TransportContext(
+                ring_capacity=configuration.event_ring_capacity)
+        else:
+            transport = TransportContext()
+        start_kwargs = dict(is_client=True, alpn="h3",
+                            max_datagram_frame_size=64 * 1024)
+        if configuration is not None:
+            # Thread FC sizing, stream caps, idle timeout, and the CC
+            # algorithm through to picoquic. Without this the peer
+            # advertises picoquic defaults and the connection runs the
+            # compile-time CC regardless of configuration.
+            start_kwargs.update(
+                rx_data_ring_cap=configuration.max_stream_data,
+                initial_max_data=configuration.max_data,
+                initial_max_streams_uni=configuration.max_streams_uni,
+                initial_max_streams_bidi=configuration.max_streams_bidi,
+                idle_timeout_ms=int(configuration.idle_timeout * 1000),
+                congestion_control_algorithm=(
+                    configuration.congestion_control_algorithm),
+                keep_alive_interval_ms=int(
+                    (configuration.keep_alive_interval or 0) * 1000),
+                socket_buffer_size=(
+                    configuration.socket_buffer_size or 0),
+                qlog_dir=configuration.qlog_dir,
+            )
+        transport.start(**start_kwargs)
 
     client = WebTransportClient(transport, host, port, path, sni=sni,
                                   wt_available_protocols=wt_available_protocols)
+    if configuration is not None:
+        client.tx_max_queued_bytes = configuration.tx_max_queued_bytes
+        client.stream_ring_cap = configuration.stream_ring_cap
     try:
         await client.open(timeout=timeout)
         yield client
@@ -905,6 +1032,7 @@ async def serve_webtransport(
         cert_file: str, key_file: str,
         transport: TransportContext | None = None,
         session_factory=None,
+        configuration: QuicConfiguration | None = None,
 ) -> WebTransportServer:
     """Start a WebTransport server listening on (host, port) at path.
 
@@ -921,8 +1049,13 @@ async def serve_webtransport(
         path = "/"
     own_transport = transport is None
     if own_transport:
-        transport = TransportContext()
-        transport.start(
+        if (configuration is not None
+                and configuration.event_ring_capacity is not None):
+            transport = TransportContext(
+                ring_capacity=configuration.event_ring_capacity)
+        else:
+            transport = TransportContext()
+        start_kwargs = dict(
             port=port,
             cert_file=cert_file, key_file=key_file,
             alpn="h3",
@@ -930,10 +1063,49 @@ async def serve_webtransport(
             max_datagram_frame_size=64 * 1024,
             wt_path=path,
         )
+        if configuration is not None:
+            # Thread FC sizing, stream caps, idle timeout, and the CC
+            # algorithm through to picoquic. Without this the server
+            # advertises picoquic defaults and the connection runs the
+            # compile-time CC regardless of configuration.
+            start_kwargs.update(
+                rx_data_ring_cap=configuration.max_stream_data,
+                initial_max_data=configuration.max_data,
+                initial_max_streams_uni=configuration.max_streams_uni,
+                initial_max_streams_bidi=configuration.max_streams_bidi,
+                idle_timeout_ms=int(configuration.idle_timeout * 1000),
+                congestion_control_algorithm=(
+                    configuration.congestion_control_algorithm),
+                keep_alive_interval_ms=int(
+                    (configuration.keep_alive_interval or 0) * 1000),
+                socket_buffer_size=(
+                    configuration.socket_buffer_size or 0),
+                qlog_dir=configuration.qlog_dir,
+            )
+        transport.start(**start_kwargs)
 
     loop = asyncio.get_event_loop()
     dispatcher = _get_dispatcher_registry().attach_acceptor(
         loop, transport, handler)
-    if session_factory is not None:
+    if configuration is not None:
+        # Stamp the aggregate TX budget on every accepted session —
+        # the dispatcher's factory is the only per-session hook on
+        # the server side.
+        cap = configuration.tx_max_queued_bytes
+        inner_factory = session_factory
+
+        ring_cap = configuration.stream_ring_cap
+
+        def _budget_factory(transport_, state):
+            if inner_factory is not None:
+                session = inner_factory(transport_, state)
+            else:
+                session = WebTransportServerSession(transport_, state)
+            session.tx_max_queued_bytes = cap
+            session.stream_ring_cap = ring_cap
+            return session
+
+        dispatcher.set_session_factory(_budget_factory)
+    elif session_factory is not None:
         dispatcher.set_session_factory(session_factory)
     return WebTransportServer(transport, dispatcher, own_transport)

@@ -249,7 +249,7 @@ static inline aiopquic_wt_stream_link_t* aiopquic_wt_ensure_link(
 }
 
 /*
- * Phase B WT push: notification event carrying a BORROWED pointer to
+ * WT push: notification event carrying a BORROWED pointer to
  * the per-stream aiopquic_stream_ctx_t. No inline byte copy — bytes
  * live in sc->rx and the consumer (asyncio drain_rx) pops them
  * directly. entry.data_length=0 signals "borrowed" to spsc_ring_pop
@@ -265,6 +265,16 @@ static inline void aiopquic_wt_push_event_with_sc(
         uint64_t stream_id,
         aiopquic_stream_ctx_t* sc,
         uint8_t is_fin) {
+    /* RX data-event coalescing — see the raw-QUIC twin in callback.h.
+     * At most one outstanding WT_STREAM_DATA notification per
+     * stream; losers skip (the in-flight notification's drain pops all
+     * available sc->rx bytes). FIN always pushes. */
+    if (event_type == SPSC_EVT_WT_STREAM_DATA) {
+        if (!aiopquic_stream_ctx_rx_event_pending_arm(sc)) {
+            s->bridge->cnt_rx_data_event_coalesced++;
+            return;
+        }
+    }
     spsc_entry_t entry = {0};
     entry.event_type = event_type;
     entry.stream_id = stream_id;
@@ -280,6 +290,8 @@ static inline void aiopquic_wt_push_event_with_sc(
         s->bridge->worker_rx_event_drops++;
         if (event_type == SPSC_EVT_WT_STREAM_DATA) {
             s->bridge->worker_rx_event_drops_stream_data++;
+            /* Clear rx_event_pending so the next arrival retries. */
+            aiopquic_stream_ctx_rx_event_pending_clear(sc);
         }
         if (aiopquic_rx_log_enabled()
                 && s->bridge->worker_rx_event_drops <= 100) {
@@ -371,7 +383,7 @@ static inline void aiopquic_wt_push_new_stream(
  * (and its sc) are still alive. drain_rx surfaces this and does NOT
  * call any destroy — LINK_RELEASE owns the sc ref drop.
  */
-static inline void aiopquic_wt_push_stream_destroy(
+static inline int aiopquic_wt_push_stream_destroy(
         aiopquic_wt_session_t* s,
         uint64_t stream_id) {
     spsc_entry_t entry = {0};
@@ -383,12 +395,16 @@ static inline void aiopquic_wt_push_stream_destroy(
     if (ret == 0) {
         aiopquic_notify_rx(s->bridge);
     } else {
-        /* RX ring full. The Python dict will retain a stale entry
-         * for this stream until session close clears it. Bounded
-         * by per-cnx stream count; surface via the existing drop
+        /* RX ring full. The Python dict retains a stale entry for
+         * this stream until session close clears it. The CALLER
+         * must skip the paired link_release when this fails —
+         * freeing the sc while Python's dict still maps the sid
+         * would leave a dangling pointer for any sid-keyed access.
+         * Bounded by per-cnx stream count; surfaced via the drop
          * counter so sustained drops are visible. */
         s->bridge->worker_rx_event_drops++;
     }
+    return ret;
 }
 
 static inline void aiopquic_wt_push_link_release(
@@ -489,6 +505,12 @@ static int aiopquic_wt_path_callback(
 
     case picohttp_callback_connect_accepted:
         s->session_ready = 1;
+        if (s->bridge != NULL && s->bridge->keep_alive_us > 0) {
+            /* PING keep-alive on the WT cnx — same rationale as the
+             * raw-QUIC path: hold a quiet (e.g. FC-stalled) connection
+             * open past the idle timeout. Worker thread owns cnx here. */
+            picoquic_enable_keep_alive(cnx, s->bridge->keep_alive_us);
+        }
         aiopquic_wt_log_cnxid("client-cnx-ready", cnx, UINT64_MAX);
         aiopquic_wt_push_event(s, SPSC_EVT_WT_SESSION_READY,
                                 s->control_stream_id, 0, NULL, 0);
@@ -528,10 +550,9 @@ static int aiopquic_wt_path_callback(
             aiopquic_stream_ctx_t* sc = link->sc;
 
             uint32_t advertise_cap =
-                s->bridge->rx_ring_cap > 0
-                    ? s->bridge->rx_ring_cap
-                    : AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT;
-            uint32_t fc_threshold = advertise_cap / AIOPQUIC_RX_FC_THRESHOLD_DIV;
+                s->bridge->rx_data_ring_cap > 0
+                    ? s->bridge->rx_data_ring_cap
+                    : AIOPQUIC_RX_DATA_RING_CAP_DEFAULT;
             int rx_first = (sc->rx == NULL);
             if (rx_first) {
                 /* Switch picoquic to app-controlled FC on this stream.
@@ -575,7 +596,6 @@ static int aiopquic_wt_path_callback(
                 (void)picoquic_open_flow_control(cnx, sid, buf_free);
                 aiopquic_stream_ctx_rx_credit_store(sc, advertise_cap);
             }
-            (void)fc_threshold;  /* still computed for future hysteresis */
             if (first_touch) {
                 aiopquic_wt_push_new_stream(s, sid, sc);
             }
@@ -602,9 +622,9 @@ static int aiopquic_wt_path_callback(
             aiopquic_stream_ctx_t* sc = link->sc;
 
             uint32_t advertise_cap =
-                s->bridge->rx_ring_cap > 0
-                    ? s->bridge->rx_ring_cap
-                    : AIOPQUIC_RX_STREAM_RING_CAP_DEFAULT;
+                s->bridge->rx_data_ring_cap > 0
+                    ? s->bridge->rx_data_ring_cap
+                    : AIOPQUIC_RX_DATA_RING_CAP_DEFAULT;
             int rx_first = (sc->rx == NULL);
             if (rx_first) {
                 (void)picoquic_set_app_flow_control(cnx, sid, 1);
@@ -667,6 +687,7 @@ static int aiopquic_wt_path_callback(
             bytes, to_send, is_fin, still_active);
         if (buf && to_send > 0) {
             aiopquic_stream_buf_pop(sb, buf, to_send);
+            aiopquic_tx_data_bytes_pulled_add(to_send);
             if (getenv("AIOPQUIC_WT_DEBUG") != NULL) {
                 fprintf(stderr, "[wt-debug] provide sid=%llu len=%u "
                         "is_fin=%d still_active=%d hex=",
@@ -809,9 +830,17 @@ static int aiopquic_wt_path_callback(
             stream_ctx->path_callback_ctx = NULL;
             /* Order: STREAM_DESTROY first (Python dict cleanup),
              * then LINK_RELEASE (link + sc ref drop). FIFO on the
-             * SPSC ring preserves this ordering at the consumer. */
-            aiopquic_wt_push_stream_destroy(s, sid);
-            aiopquic_wt_push_link_release(s, sid, link);
+             * SPSC ring preserves this ordering at the consumer.
+             * PAIRED: if the destroy push fails (ring full), skip
+             * the release too — otherwise drain_rx frees the sc
+             * while Python's dict still maps the sid, leaving a
+             * dangling pointer for any sid-keyed access. Leaking
+             * the link+sc instead preserves "present in dict ⇒ sc
+             * alive"; bounded by per-cnx stream count and swept at
+             * session close. */
+            if (aiopquic_wt_push_stream_destroy(s, sid) == 0) {
+                aiopquic_wt_push_link_release(s, sid, link);
+            }
         } else if (link) {
             /* Diagnostic: cleanup skipped despite a link being
              * provided via path_app_ctx. Tracks the leak signature
@@ -879,6 +908,10 @@ static int aiopquic_wt_server_path_callback(
     s->control_stream = stream_ctx;
     s->control_stream_id = stream_ctx->stream_id;
     s->session_ready = 1;
+    if (bridge != NULL && bridge->keep_alive_us > 0) {
+        /* PING keep-alive on the accepted WT cnx (worker thread). */
+        picoquic_enable_keep_alive(cnx, bridge->keep_alive_us);
+    }
     aiopquic_wt_log_cnxid("server-cnx-accept", cnx, stream_ctx->stream_id);
 
     stream_ctx->path_callback = aiopquic_wt_path_callback;
@@ -1056,6 +1089,46 @@ static int aiopquic_wt_handle_tx(picoquic_quic_t* quic,
         if (!s || !s->cnx) return 1;
         picoquic_stop_sending(s->cnx, entry->stream_id,
                                entry->error_code);
+        return 1;
+    }
+
+    case SPSC_EVT_TX_WT_SESSION_CLEANUP: {
+        /* Bulk-free this session's per-stream wt_links without
+         * tearing down the session itself. Mirrors step 1 of
+         * TX_WT_DEREGISTER. Used by SESSION_CLOSED handler when the
+         * cnx is stalled (cwin pinned, peer disconnected, BBR #2118
+         * freeze) and per-sid RESETs can't be transmitted. The
+         * session object survives so the Python wrapper's __dealloc__
+         * can later push TX_WT_DEREGISTER for full teardown.
+         *
+         * Idempotent: subsequent calls find empty splay tree and
+         * no-op. */
+        if (s && s->cnx && s->h3_ctx) {
+            picosplay_node_t* node =
+                picosplay_first(&s->h3_ctx->h3_stream_tree);
+            while (node != NULL) {
+                h3zero_stream_ctx_t* st =
+                    (h3zero_stream_ctx_t*)picohttp_stream_node_value(node);
+                picosplay_node_t* next = picosplay_next(node);
+                if (st != NULL && st->path_callback_ctx != NULL) {
+                    uint32_t kind = *(uint32_t*)st->path_callback_ctx;
+                    if (kind == AIOPQUIC_WT_CTX_LINK) {
+                        aiopquic_wt_stream_link_t* lk =
+                            (aiopquic_wt_stream_link_t*)
+                                st->path_callback_ctx;
+                        if (lk->session == s) {
+                            st->path_callback = NULL;
+                            st->path_callback_ctx = NULL;
+                            if (s->bridge) {
+                                s->bridge->cnt_sc_destroy_wt_link_close_walker++;
+                            }
+                            aiopquic_wt_stream_link_destroy(lk);
+                        }
+                    }
+                }
+                node = next;
+            }
+        }
         return 1;
     }
 
