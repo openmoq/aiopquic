@@ -4,7 +4,19 @@
 
 ### Report the real negotiated ALPN
 
-- `ProtocolNegotiated` / `HandshakeCompleted` now carry the ALPN that TLS actually negotiated (read from picoquic via `picoquic_tls_get_negotiated_alpn`), not `alpn_protocols[0]`. Reporting the first *configured* protocol was correct only while exactly one ALPN was offered; a client offering multiple versions (e.g. `["moqt-16", "moq-00"]`) would otherwise believe it was speaking its first preference regardless of what the peer selected, and derive the wrong protocol version. Enables correct multi-version negotiation in higher layers (aiomoqt 0.9.8). New `TransportContext.get_negotiated_alpn(cnx_ptr)` exposes it; falls back to the configured first ALPN when picoquic can't report one.
+- `ProtocolNegotiated` / `HandshakeCompleted` now carry the ALPN that TLS actually negotiated (read from picoquic via `picoquic_tls_get_negotiated_alpn`), not `alpn_protocols[0]`. Reporting the first *configured* protocol was correct only while exactly one ALPN was offered; a client offering multiple versions (e.g. `["moqt-16", "moq-00"]`) would otherwise believe it was speaking its first preference regardless of what the peer selected, and derive the wrong protocol version. Enables correct multi-version negotiation in higher layers (aiomoqt 0.9.8). New `TransportContext.get_negotiated_alpn(cnx_ptr)` exposes it; falls back to the configured first ALPN only when exactly one was configured (else `None` — a multi-version offer can't be guessed).
+
+### Multi-version negotiation (raw-QUIC ALPN list + WebTransport WT-Protocol)
+
+- **Raw-QUIC multi-ALPN.** A `QuicConfiguration` with more than one `alpn_protocols` entry now negotiates instead of offering only the first. The client advertises the full ordered list in its TLS ClientHello (via picoquic's `request_alpn_list` callback + `picoquic_add_proposed_alpn`, from a bridge-owned string array); a server selects the highest mutually-supported ALPN via `picoquic_set_alpn_select_fn_v2` (server preference, RFC 7301). A single-element list keeps the previous `default_alpn` fast path unchanged. No upstream picoquic patch needed — this uses picoquic's existing public callback (the one its own demo client uses).
+- **Clean no-common-ALPN failure.** When client and server share no ALPN, the handshake now fails `connect()` promptly with a `ConnectionError` instead of hanging until the idle timeout: `QuicConnectionProtocol.wait_connected()` is rejected on a pre-handshake `ConnectionTerminated` (WRONG_ALPN) rather than only setting the closed event.
+- **WebTransport WT-Protocol.** The server selects a subprotocol from a configured allowlist (`serve_webtransport(wt_supported_protocols=[...])` → `picowt_select_wt_protocol`; h3zero emits the `WT-Protocol` response header automatically); the client captures the selected value at CONNECT acceptance. Both sides read it back via `WebTransportSession.negotiated_protocol`. WT-Protocol is optional, so no overlap still establishes the session with `negotiated_protocol == None` (version policy belongs to the application).
+- `TransportContext.start(alpn_list=[...])` is the low-level knob underneath both the client offer and the server allowlist.
+
+### draft-18 groundwork — vi64 varint codec
+
+- `Buffer.push_uint_vi64` / `pull_uint_vi64` (`_buffer.pyx`) and `StreamChain.pull_uint_vi64` (`_streamchain.pyx`): the draft-18 §1.4.1 variable-length integer (leading-1-bits length prefix, 1–9 bytes, full uint64; non-minimal encodings accepted on decode, minimal on encode). Distinct from the RFC 9000 2-bit-prefix varint, which is untouched — these are additive, inert until d18 wiring consumes them (zero behavioral risk for d14/d16). Validated against draft-18 Table 2.
+- `StreamChain.parse_object_subgroup_vi64` and `encode_object_subgroup_vi64` (`_streamchain.pyx`): draft-18 twins of the subgroup-stream object-body codec — identical body shape, vi64 instead of the RFC 9000 varint — so the d18 data hot path stays in C while the d14/d16 functions are left byte-for-byte unchanged.
 
 ## v0.3.7
 

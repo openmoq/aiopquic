@@ -38,8 +38,9 @@ cdef class Buffer:
     cdef Py_ssize_t _pos
     cdef bint _growable
     cdef bint _own_buf
+    cdef bint _vi64
 
-    def __cinit__(self, capacity=None, data=None):
+    def __cinit__(self, capacity=None, data=None, vi64=False):
         cdef const uint8_t* src
         cdef Py_ssize_t n
         cdef bytes b
@@ -47,6 +48,7 @@ cdef class Buffer:
         self._pos = 0
         self._growable = False
         self._own_buf = False
+        self._vi64 = bool(vi64)
         if data is not None:
             b = bytes(data)
             n = len(b)
@@ -79,6 +81,17 @@ cdef class Buffer:
     @property
     def capacity(self) -> int:
         return self._capacity
+
+    @property
+    def vi64(self) -> bool:
+        """Variable-length-integer flavor for push_vint/pull_vint:
+        True = draft-18 vi64, False = RFC9000 varint. Settable so a
+        buffer wrapping received bytes can be tagged after construction."""
+        return self._vi64
+
+    @vi64.setter
+    def vi64(self, bint value):
+        self._vi64 = value
 
     @property
     def data(self):
@@ -197,6 +210,37 @@ cdef class Buffer:
         result_obj = int.from_bytes(raw, "big") & ((1 << 62) - 1)
         return result_obj
 
+    cpdef object pull_uint_vi64(self):
+        """draft-18 vi64 varint (§1.4.1): the count of leading 1-bits in
+        the first byte gives the length (1-9 bytes); the bits after the
+        first 0 plus subsequent bytes are the value, big-endian.
+        Non-minimal encodings are accepted (0x8025 == 0x25 == 37)."""
+        if self._pos + 1 > self._capacity:
+            raise BufferReadError("read out of bounds")
+        cdef uint8_t first = self._buf[self._pos]
+        cdef int k = 0
+        while k < 8 and (first & (0x80 >> k)):
+            k += 1
+        cdef int n = k + 1
+        if self._pos + n > self._capacity:
+            raise BufferReadError("read out of bounds")
+        cdef uint8_t* p = self._buf + self._pos
+        self._pos += n
+        # k+1 == 9 → first byte 0xFF contributes no value bits (mask 0).
+        cdef uint64_t v = first & <uint8_t>(0xFF >> (k + 1))
+        cdef int i
+        for i in range(1, n):
+            v = (v << 8) | p[i]
+        return v
+
+    cpdef object pull_vint(self):
+        """Pull a variable-length integer in this buffer's flavor
+        (vi64 if self._vi64 else RFC9000 varint). Dispatch is one C
+        branch — no per-call codec lookup above."""
+        if self._vi64:
+            return self.pull_uint_vi64()
+        return self.pull_uint_var()
+
     def pull_bytes(self, Py_ssize_t n):
         if n < 0:
             raise BufferReadError("negative read length")
@@ -299,6 +343,43 @@ cdef class Buffer:
             p[7] = <uint8_t>(v & 0xFF)
         self._pos += n
         return 0
+
+    cpdef int push_uint_vi64(self, object v_obj) except -1:
+        """draft-18 vi64 varint (§1.4.1), minimal length."""
+        cdef uint64_t v = <uint64_t>v_obj
+        cdef int n
+        if v < (<uint64_t>1 << 7): n = 1
+        elif v < (<uint64_t>1 << 14): n = 2
+        elif v < (<uint64_t>1 << 21): n = 3
+        elif v < (<uint64_t>1 << 28): n = 4
+        elif v < (<uint64_t>1 << 35): n = 5
+        elif v < (<uint64_t>1 << 42): n = 6
+        elif v < (<uint64_t>1 << 49): n = 7
+        elif v < (<uint64_t>1 << 56): n = 8
+        else: n = 9
+        self._check_push(n)
+        cdef uint8_t* p = self._buf + self._pos
+        cdef int i
+        if n == 9:
+            p[0] = 0xFF
+            for i in range(1, 9):
+                p[i] = <uint8_t>((v >> (8 * (8 - i))) & 0xFF)
+        else:
+            # first byte: (n-1) leading ones + a 0, then the top value bits
+            p[0] = <uint8_t>((~(0xFF >> (n - 1)) & 0xFF)
+                             | (v >> (8 * (n - 1))))
+            for i in range(1, n):
+                p[i] = <uint8_t>((v >> (8 * (n - 1 - i))) & 0xFF)
+        self._pos += n
+        return 0
+
+    cpdef int push_vint(self, object v_obj) except -1:
+        """Push a variable-length integer in this buffer's flavor
+        (vi64 if self._vi64 else RFC9000 varint). Dispatch is one C
+        branch — no per-call codec lookup above."""
+        if self._vi64:
+            return self.push_uint_vi64(v_obj)
+        return self.push_uint_var(v_obj)
 
     cpdef int push_bytes(self, object data) except -1:
         cdef Py_ssize_t n
