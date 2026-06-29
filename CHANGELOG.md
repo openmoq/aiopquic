@@ -1,10 +1,28 @@
 # Changelog
 
-## v0.3.8 (unreleased)
+## v0.3.10 (2026-06-29)
 
-### Report the real negotiated ALPN
+Pairs with aiomoqt 0.10.5. No public API changes — tooling, CI, and docs.
 
-- `ProtocolNegotiated` / `HandshakeCompleted` now carry the ALPN that TLS actually negotiated (read from picoquic via `picoquic_tls_get_negotiated_alpn`), not `alpn_protocols[0]`. Reporting the first *configured* protocol was correct only while exactly one ALPN was offered; a client offering multiple versions (e.g. `["moqt-16", "moq-00"]`) would otherwise believe it was speaking its first preference regardless of what the peer selected, and derive the wrong protocol version. Enables correct multi-version negotiation in higher layers (aiomoqt 0.9.8). New `TransportContext.get_negotiated_alpn(cnx_ptr)` exposes it; falls back to the configured first ALPN only when exactly one was configured (else `None` — a multi-version offer can't be guessed).
+### Tooling
+
+- **`update_submodules.sh` — gated submodule pin advancer / surveyor.** Surveys and (with `--advance`) advances the vendored `picoquic` / `picotls` / `liburing` pins to the newest upstream commit that still builds and passes the test suite. The default run is a zero-side-effect dry-run drift report (pin SHA vs upstream, commits behind, version delta). `--advance` checks out the candidate, rebuilds (`build_picoquic.sh`), runs `pytest -m "not interop"` as the gate, and stages the pin on pass; on failure it restores the original pin and stops (fail-fast), with `--walk` to step back to the latest passing commit. `picotls` is treated as a *derived* pin that follows picoquic's blessed PTLS tag rather than its own master; `liburing` is held (it is `find_library()`'d, blessing no version). Flags: `--only`, `--to`, `--walk`, `--force`, `--no-build`, `--commit`.
+- **`bench_vint_codec.py`** prints a SUMMARY block (vi64-vs-RFC9000 codec ratio + `push_vint`/`pull_vint` dispatch overhead with a one-line verdict); docstring run command corrected.
+
+### CI
+
+- **s2n-quic interop peer build hardened.** The native `s2n-quic-qns` interop peer is pinned to release tag `v1.83.0` for reproducibility and built with the `@beta` Rust toolchain instead of `@stable`: s2n-quic ships no `Cargo.lock`, so cargo floats `s2n-tls` to its newest 0.3.x, whose MSRV can outrun the runner's current stable (e.g. s2n-tls 0.3.39 needs rustc 1.89 while stable was 1.88). `beta` is always stable+1 and folds back once stable catches up. The clone now runs *before* the `rust-cache` step, which executes `cargo metadata` in the workspace to compute its key and otherwise errored ("cwd does not exist") on a cache miss.
+
+### Docs
+
+- `pyproject.toml` wheel-matrix comment corrected: builds target cp312 / cp313 / cp314 (Python 3.12+), not "cp314 only / 3.14+".
+- `DATAFLOW.md` config table: `idle_timeout` default is 30 s (matches picoquic), not 10 s; removed a stale 10s-rationale comment block left in `QuicConfiguration` directly above the correct 30 s block.
+
+### Vendored pins shipped
+
+- picoquic `d6c5653d` (1.1.49.2) · picotls `bfa6787` · liburing `5227d48b` (2.7) — reported at runtime by `python -m aiopquic.versions`.
+
+## v0.3.9 (2026-06-20)
 
 ### Multi-version negotiation (raw-QUIC ALPN list + WebTransport WT-Protocol)
 
@@ -18,7 +36,13 @@
 - `Buffer.push_uint_vi64` / `pull_uint_vi64` (`_buffer.pyx`) and `StreamChain.pull_uint_vi64` (`_streamchain.pyx`): the draft-18 §1.4.1 variable-length integer (leading-1-bits length prefix, 1–9 bytes, full uint64; non-minimal encodings accepted on decode, minimal on encode). Distinct from the RFC 9000 2-bit-prefix varint, which is untouched — these are additive, inert until d18 wiring consumes them (zero behavioral risk for d14/d16). Validated against draft-18 Table 2.
 - `StreamChain.parse_object_subgroup_vi64` and `encode_object_subgroup_vi64` (`_streamchain.pyx`): draft-18 twins of the subgroup-stream object-body codec — identical body shape, vi64 instead of the RFC 9000 varint — so the d18 data hot path stays in C while the d14/d16 functions are left byte-for-byte unchanged.
 
-## v0.3.7
+## v0.3.8 (2026-06-14)
+
+### Report the real negotiated ALPN
+
+- `ProtocolNegotiated` / `HandshakeCompleted` now carry the ALPN that TLS actually negotiated (read from picoquic via `picoquic_tls_get_negotiated_alpn`), not `alpn_protocols[0]`. Reporting the first *configured* protocol was correct only while exactly one ALPN was offered; a client offering multiple versions (e.g. `["moqt-16", "moq-00"]`) would otherwise believe it was speaking its first preference regardless of what the peer selected, and derive the wrong protocol version. Enables correct multi-version negotiation in higher layers (aiomoqt 0.9.8). New `TransportContext.get_negotiated_alpn(cnx_ptr)` exposes it; falls back to the configured first ALPN only when exactly one was configured (else `None` — a multi-version offer can't be guessed).
+
+## v0.3.7 (2026-06-14)
 
 Pairs with aiomoqt 0.9.7.
 
@@ -43,7 +67,7 @@ Pairs with aiomoqt 0.9.7.
 - Abnormal connection-close + stream-reset logging (interop / drop diagnosis).
 - WT `_on_event` dispatch reordered hot-branches-first; picotls bumped to bfa6787.
 
-## v0.3.6
+## v0.3.6 (2026-06-07)
 
 ### WT pull-model migration (parity with raw-QUIC)
 
