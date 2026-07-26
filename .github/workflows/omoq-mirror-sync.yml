@@ -1,0 +1,102 @@
+name: mirror sync
+
+# Keeps openmoq/<repo> tracking gmarzot/<repo> main + tags.
+#
+# Upstream wins every path it touches (-X theirs); paths that exist only in
+# this fork are never in conflict and survive untouched. The merge is always
+# fast-forwardable downstream — no force-push, no history rewrite. Upstream
+# has no knowledge of this fork; the relationship is pull-only.
+
+on:
+  schedule:
+    # Mirror stage of the openmoq sync cron cascade (UTC; ET shifts under DST):
+    #   03:03  aiomoqt/aiopquic mirror-sync (gmarzot → openmoq, this workflow)
+    #   03:23  picoquic upstream-sync       (private-octopus → openmoq/picoquic)
+    #   04:23  moxygen  upstream-sync       (facebookexperimental → openmoq/moxygen)
+    #   04:37  moxygen  picoquic-pin sync   (openmoq/picoquic → moxygen picoquic-rev.txt)
+    #   08:23  moqx     moxygen-submodule sync (openmoq/moxygen → moqx deps/moxygen)
+    - cron: '3 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Paths this fork owns. Anything diverging outside this list is reported as
+  # unintended drift; it is not clobbered, since upstream already wins on
+  # every path it actually touches.
+  FORK_PATHS: .github/workflows/omoq-mirror-sync.yml
+
+jobs:
+  sync:
+    runs-on: ubuntu-22.04
+    steps:
+      # App token (not GITHUB_TOKEN): pushing refs that touch
+      # .github/workflows/ requires the app's `workflows` permission.
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.OMOQ_APP_ID }}
+          private-key: ${{ secrets.OMOQ_APP_PRIV_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Merge upstream main (upstream wins)
+        run: |
+          set -euo pipefail
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          git config user.name  "omoq-sync-bot[bot]"
+          git config user.email "omoq-sync-bot[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/gmarzot/${REPO_NAME}.git"
+          git fetch --quiet upstream main --tags
+
+          UPSTREAM="$(git rev-parse upstream/main)"
+
+          if ! git merge -X theirs --no-edit \
+                 -m "openmoq: merge gmarzot/${REPO_NAME} main @ ${UPSTREAM:0:8}" \
+                 "$UPSTREAM"; then
+            git merge --abort || true
+            echo "::error::Merge of upstream/main could not be auto-resolved (rename or modify/delete). Reconcile manually."
+            exit 1
+          fi
+
+          git push --quiet origin main
+          git push --quiet origin --tags
+          echo "Synced gmarzot/${REPO_NAME} main (${UPSTREAM:0:8}) + tags"
+
+      - name: Report unintended fork drift
+        run: |
+          set -euo pipefail
+          read -r -a OWNED <<< "$FORK_PATHS"
+          EXCLUDES=()
+          for p in "${OWNED[@]}"; do EXCLUDES+=(":(exclude)${p}"); done
+
+          DRIFT="$(git diff --name-only upstream/main HEAD -- . "${EXCLUDES[@]}")"
+          if [ -n "$DRIFT" ]; then
+            echo "::warning::Fork diverges from upstream outside FORK_PATHS:"
+            echo "$DRIFT"
+          fi
+
+      - name: Notify email (mirror failure)
+        if: failure()
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.OMOQ_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.OMOQ_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          SUBJECT="[${GITHUB_REPOSITORY#*/}] mirror sync FAILED"
+          BODY="Mirror sync from gmarzot/${GITHUB_REPOSITORY#*/} failed.\n\nRun: ${RUN_URL}"
+          aws ses send-email \
+            --from "noreply@ci.openmoq.org" \
+            --destination '{"ToAddresses":["github-notifications@openmoq.org"]}' \
+            --message "{
+              \"Subject\": {\"Data\": \"${SUBJECT}\"},
+              \"Body\": {\"Text\": {\"Data\": \"${BODY}\"}}
+            }"
