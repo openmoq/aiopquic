@@ -24,6 +24,15 @@ def route_batch(events, route) -> None:
         except Exception:
             logger.exception("event type %s dropped by its handler", ev[0])
 
+
+def drain_and_route(transport, route) -> None:
+    """Drain one batch and route it. The stream contexts the batch names
+    stay alive until every event of it has been routed."""
+    try:
+        route_batch(transport.drain_rx(), route)
+    finally:
+        transport.release_batch()
+
 from .configuration import QuicConfiguration
 from .events import (
     QuicEvent, HandshakeCompleted, ConnectionTerminated,
@@ -157,9 +166,16 @@ class QuicConnection:
         # rings + RX flow-control state and is bound to picoquic's
         # app_stream_ctx slot. Lazy-created on first contact (TX from
         # send_stream_data, RX from picoquic stream_data callback).
-        # Destroyed via lifecycle hooks (Landing C); for now leak until
-        # process exit to avoid use-after-free with the picoquic worker.
         self._stream_ctxs: dict[int, int] = {}
+        # Every context whose stream reference is still held: dropped on
+        # STREAM_DESTROY (in the drain) for the one attached then, else by
+        # _destroy_stream_ctxs on close. A reset or stop-sending detaches
+        # picoquic's context, so a stream can get a second one the map
+        # above never names.
+        self._sc_owned: set[int] = set()
+        # Set once _destroy_stream_ctxs ran: an sc named by a later event
+        # is no longer ours to adopt.
+        self._stream_ctxs_dropped = False
         # Pull-model datagram TX: opaque record-ring pointer (lazy,
         # created on first send so stream-only connections pay nothing),
         # a mark-owed flag for the rare TX-event-ring-full case, and the
@@ -329,6 +345,21 @@ class QuicConnection:
             return self._transport.connection_ids(self._cnx_ptr)
         return None
 
+    def peer_address(self) -> tuple[str, int] | None:
+        """The peer's (host, port), e.g. ("127.0.0.1", 4433), or None
+        before the connection is known or after it closes. An
+        IPv4-mapped IPv6 address is returned as IPv4."""
+        if self._cnx_ptr and self._transport is not None:
+            return self._transport.peer_address(self._cnx_ptr)
+        return None
+
+    def local_address(self) -> tuple[str, int] | None:
+        """This side's (host, port) on the connection's path, as
+        peer_address()."""
+        if self._cnx_ptr and self._transport is not None:
+            return self._transport.local_address(self._cnx_ptr)
+        return None
+
     def _negotiated_alpn(self, cnx_ptr):
         """The ALPN TLS actually negotiated for this cnx, falling back
         to the first configured ALPN if picoquic can't report it.
@@ -369,14 +400,14 @@ class QuicConnection:
         effect of worker packet processing, no Python dispatch needed.
         """
         if evt_type == _EVT_STREAM_DATA or evt_type == _EVT_STREAM_FIN:
-            if _stream_ctx_ptr and stream_id not in self._stream_ctxs:
-                self._stream_ctxs[stream_id] = _stream_ctx_ptr
+            self._adopt_stream_ctx(stream_id, _stream_ctx_ptr)
             self._events.append(StreamDataReceived(
                 stream_id=stream_id,
                 data=data if data is not None else memoryview(b""),
                 end_stream=(evt_type == _EVT_STREAM_FIN),
             ))
         elif evt_type == _EVT_STREAM_RESET:
+            self._adopt_stream_ctx(stream_id, _stream_ctx_ptr)
             # Abnormal stream end (peer RESET_STREAM) — surface the code
             # so drop-under-load investigations see the actual reason
             # rather than inferring it from the relay's logs.
@@ -387,6 +418,7 @@ class QuicConnection:
                 error_code=error_code,
             ))
         elif evt_type == _EVT_STOP_SENDING:
+            self._adopt_stream_ctx(stream_id, _stream_ctx_ptr)
             self._events.append(StopSendingReceived(
                 stream_id=stream_id,
                 error_code=error_code,
@@ -418,10 +450,8 @@ class QuicConnection:
             ring_ev = getattr(self._transport, '_tx_event_ring_drain_event', None)
             if ring_ev is not None:
                 ring_ev.set()
-            # picoquic's close callback has fired — worker has stopped
-            # invoking app callbacks for this cnx's streams. Safe to
-            # free per-stream wrappers; without this they'd leak until
-            # process exit.
+            # Events still queued for these streams hold their own
+            # references.
             self._destroy_stream_ctxs()
             # Wake any parked datagram writer first so it observes
             # _closed instead of deadlocking.
@@ -472,8 +502,9 @@ class QuicConnection:
         elif evt_type == _EVT_STREAM_DESTROY:
             # Stream fully retired by picoquic — drop our cached
             # pointer so the dict doesn't accumulate stale entries.
-            # The C side has already dropped the stream-lifetime ref
-            # by the time this fires; don't deref.
+            # The drain drops the stream reference of the context named
+            # here; don't deref.
+            self._sc_owned.discard(_stream_ctx_ptr)
             # Wake any producer parked in await sc_event.wait() with
             # the about-to-be-popped Event still in hand. Without this
             # set(), the waiter would deadlock — the popped Event is
@@ -631,26 +662,26 @@ class QuicConnection:
         QuicEngine after demuxing by cnx_ptr.
         """
         if evt_type == _EVT_STREAM_DATA:
-            if stream_ctx_ptr and stream_id not in self._stream_ctxs:
-                self._stream_ctxs[stream_id] = stream_ctx_ptr
+            self._adopt_stream_ctx(stream_id, stream_ctx_ptr)
             self._events.append(StreamDataReceived(
                 stream_id=stream_id,
                 data=data if data is not None else memoryview(b""),
                 end_stream=False,
             ))
         elif evt_type == _EVT_STREAM_FIN:
-            if stream_ctx_ptr and stream_id not in self._stream_ctxs:
-                self._stream_ctxs[stream_id] = stream_ctx_ptr
+            self._adopt_stream_ctx(stream_id, stream_ctx_ptr)
             self._events.append(StreamDataReceived(
                 stream_id=stream_id,
                 data=data if data is not None else memoryview(b""),
                 end_stream=True,
             ))
         elif evt_type == _EVT_STREAM_RESET:
+            self._adopt_stream_ctx(stream_id, stream_ctx_ptr)
             self._events.append(StreamReset(
                 stream_id=stream_id, error_code=error_code,
             ))
         elif evt_type == _EVT_STOP_SENDING:
+            self._adopt_stream_ctx(stream_id, stream_ctx_ptr)
             self._events.append(StopSendingReceived(
                 stream_id=stream_id, error_code=error_code,
             ))
@@ -704,6 +735,7 @@ class QuicConnection:
         elif evt_type == _EVT_DATAGRAM_LOST:
             self._datagrams_lost += 1
         elif evt_type == _EVT_STREAM_DESTROY:
+            self._sc_owned.discard(stream_ctx_ptr)
             # Wake a producer parked on this stream before dropping the
             # Event it holds; see the client-path branch.
             ev = self._stream_tx_drain_events.get(stream_id)
@@ -725,21 +757,24 @@ class QuicConnection:
         if sc is None:
             sc = stream_ctx_create()
             self._stream_ctxs[stream_id] = sc
+            self._sc_owned.add(sc)
         return sc
 
+    def _adopt_stream_ctx(self, stream_id: int, sc: int) -> None:
+        if sc and not self._stream_ctxs_dropped:
+            self._sc_owned.add(sc)
+            if stream_id not in self._stream_ctxs:
+                self._stream_ctxs[stream_id] = sc
+
     def _destroy_stream_ctxs(self) -> None:
-        """Free all per-stream wrappers + their TX/RX byte rings.
-        Idempotent — safe to call multiple times. Called when the
-        connection-close callback has fired (picoquic worker has
-        stopped invoking app callbacks for this cnx's streams).
-        Per-stream early cleanup (before connection close) requires
-        picoquic_unlink_app_stream_ctx via SPSC dispatch; deferred to
-        a future landing — bounded leak per connection until then."""
-        if not self._stream_ctxs:
-            return
-        for sc in self._stream_ctxs.values():
-            stream_ctx_destroy(sc)
+        """Drop the connection's reference to every stream context, on
+        close or stop(). A context is freed when the last reference goes;
+        queued events and live StreamChunks hold their own. Idempotent."""
+        self._stream_ctxs_dropped = True
         self._stream_ctxs.clear()
+        for sc in self._sc_owned:
+            stream_ctx_destroy(sc)
+        self._sc_owned.clear()
 
     def send_stream_data(self, stream_id: int, data: bytes,
                          end_stream: bool = False) -> None:
@@ -1206,6 +1241,7 @@ class QuicEngine:
                                         * 1000),
             socket_buffer_size=(cfg.socket_buffer_size or 0),
             qlog_dir=cfg.qlog_dir,
+            max_connections=getattr(cfg, 'max_connections', 256),
         )
         kwargs.update(extra)
         self._transport.start(**kwargs)
@@ -1228,7 +1264,7 @@ class QuicEngine:
         """
         if self._transport is None:
             return
-        route_batch(self._transport.drain_rx(), self.route_event)
+        drain_and_route(self._transport, self.route_event)
 
     def route_event(self, ev) -> None:
         """Route one already-drained event (also the entry point for an

@@ -237,9 +237,9 @@ static const char* aiopquic_wt_list_next(const char* p, const char* end,
 int picowt_set_wt_protocol(h3zero_stream_ctx_t* stream_ctx,
                            const char* selected_protocol);
 
-/* Select the WT-Protocol by the server's order: the first entry of
- * `supported` (CSV, most preferred first) that the client offered.
- * Sets stream_state.wt_protocol on a match. */
+/* Select the WT-Protocol by the client's preference order: the first
+ * offered entry that is in `supported` (CSV). Sets stream_state.wt_protocol
+ * on a match. */
 static int aiopquic_wt_select_protocol(h3zero_stream_ctx_t* st,
                                        const char* supported) {
     const char* offer =
@@ -261,11 +261,11 @@ static int aiopquic_wt_select_protocol(h3zero_stream_ctx_t* st,
     }
     if (!offered) return AIOPQUIC_WT_PROTO_NONE_OFFERED;
 
-    for (const char* p = supported;
-         (p = aiopquic_wt_list_next(p, sup_end, &sv, &slen)) != NULL;) {
-        if (slen == 0) continue;
-        for (const char* q = offer;
-             (q = aiopquic_wt_list_next(q, offer_end, &o, &olen)) != NULL;) {
+    for (const char* q = offer;
+         (q = aiopquic_wt_list_next(q, offer_end, &o, &olen)) != NULL;) {
+        if (olen == 0) continue;
+        for (const char* p = supported;
+             (p = aiopquic_wt_list_next(p, sup_end, &sv, &slen)) != NULL;) {
             if (olen == slen && memcmp(o, sv, slen) == 0) {
                 char sel[256];
                 if (slen >= sizeof(sel)) break;
@@ -1237,6 +1237,16 @@ static int aiopquic_wt_server_path_callback(
     (void)h3zero_declare_stream_prefix(
         h3_ctx, s->control_stream_id,
         aiopquic_wt_path_callback, s);
+
+    {
+        /* Cached ahead of NEW_SESSION, so the accepted session has it. */
+        aiopquic_cnx_snapshot_t snap;
+        aiopquic_cnx_snapshot_fill(cnx, &snap);
+        spsc_entry_t se = {0};
+        se.event_type = SPSC_EVT_CNX_SNAPSHOT;
+        se.cnx = cnx;
+        (void)aiopquic_rx_push(bridge, &se, (const uint8_t*)&snap, sizeof(snap));
+    }
 
     spsc_entry_t entry = {0};
     entry.event_type = SPSC_EVT_WT_NEW_SESSION;
