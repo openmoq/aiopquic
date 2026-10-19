@@ -184,7 +184,8 @@ static inline int aiopquic_fc_raw_enabled(void) {
  * Stored in the entry's data_buf as: header + sni + alpn.
  */
 typedef struct {
-    struct sockaddr_in addr;
+    struct sockaddr_storage addr;
+    uint32_t desired_version;           /* 0: stay in the initial version */
     uint16_t sni_len;
     uint16_t alpn_len;
     /* followed by: sni_len bytes of SNI, then alpn_len bytes of ALPN */
@@ -292,6 +293,7 @@ typedef struct {
     uint64_t        cnt_wake_calls;                /* picoquic_wake_up_network_thread invoked */
     uint64_t        cnt_wake_skipped_coalesced;    /* wake skipped (tx_wake_pending already 1) */
     uint64_t        cnt_prepare_to_send_empty;     /* prepare_to_send invoked with avail==0 */
+    uint64_t        cnt_loop_cb;                   /* worker loop callbacks: moves while the worker runs */
     uint64_t        last_tx_event_ring_arm_ns;           /* CLOCK_MONOTONIC of last arm */
     uint64_t        last_tx_event_ring_fire_ns;          /* CLOCK_MONOTONIC of last fire */
     /* RX flow-control observability (added 2026-05-25). Drain side
@@ -579,6 +581,7 @@ typedef struct {
     uint64_t data_received;
     aiopquic_addr_t peer_addr;
     aiopquic_addr_t local_addr;
+    uint8_t session_resumed;            /* TLS resumed with a PSK */
 } aiopquic_cnx_snapshot_t;
 
 /* Worker thread only. */
@@ -606,6 +609,7 @@ static inline void aiopquic_cnx_snapshot_fill(picoquic_cnx_t* cnx,
     picoquic_get_default_path_quality(cnx, &s->path_quality);
     s->data_sent = picoquic_get_data_sent(cnx);
     s->data_received = picoquic_get_data_received(cnx);
+    s->session_resumed = picoquic_tls_is_psk_handshake(cnx) ? 1 : 0;
     struct sockaddr* sa = NULL;
     picoquic_get_peer_addr(cnx, &sa);
     aiopquic_addr_fill(sa, &s->peer_addr);
@@ -998,14 +1002,13 @@ static inline void aiopquic_notify_rx(aiopquic_ctx_t* ctx) {
  *      will write the wake fd (the producer's exchange sees 0→1).
  *   2. Drain the wake-fd counter (Linux: one read; other: read until
  *      EAGAIN).
- *   3. Re-arm by writing the wake fd if the ring is still non-empty.
+ *   3. Re-arm by writing the wake fd if the ring or the overflow is
+ *      still non-empty.
  *      Covers the race where a producer pushed an entry between the
  *      consumer's peek-empty and pending=0, observing pending=1 and
  *      thus skipping its own wake write — without re-arm those
  *      stranded entries would never wake asyncio again. */
 static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
-    /* Overflow left behind must keep the wake armed: the re-arm below
-     * looks at the ring only. */
     spsc_ring_refill_from_overflow(ctx->rx_event_ring, &ctx->rx_overflow);
     /* Exchange, so the re-check below cannot read the ring before the
      * clear is visible to aiopquic_notify_rx's exchange. */
@@ -1019,7 +1022,12 @@ static inline void aiopquic_clear_rx(aiopquic_ctx_t* ctx) {
         /* drain */
     }
 #endif
-    if (!spsc_ring_empty(ctx->rx_event_ring)) {
+    /* Overflow counts too: a push that decided "overflow" before the
+     * refill above and counted itself after it can have its wake consumed
+     * by the read above while the ring is still empty. */
+    if (!spsc_ring_empty(ctx->rx_event_ring) ||
+            atomic_load_explicit(&ctx->rx_overflow.depth,
+                                 memory_order_seq_cst) > 0) {
 #ifdef __linux__
         uint64_t one = 1;
         (void)write(ctx->wake_write_fd, &one, sizeof(one));
@@ -1566,6 +1574,7 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                              void* callback_ctx,
                              void* callback_argv) {
     aiopquic_ctx_t* ctx = (aiopquic_ctx_t*)callback_ctx;
+    ctx->cnt_loop_cb++;
 
     switch (cb_mode) {
         case picoquic_packet_loop_ready:
@@ -1621,14 +1630,26 @@ static int aiopquic_loop_cb(picoquic_quic_t* quic,
                             alpn_ptr = alpn_buf;
                         }
 
-                        picoquic_cnx_t* new_cnx = picoquic_create_client_cnx(
-                            quic,
+                        /* picoquic_create_client_cnx, with the desired version
+                         * set before the first Initial goes out. */
+                        picoquic_cnx_t* new_cnx = picoquic_create_cnx(
+                            quic, picoquic_null_connection_id,
+                            picoquic_null_connection_id,
                             (struct sockaddr*)&p->addr,
-                            picoquic_current_time(),
-                            0,
-                            sni_ptr, alpn_ptr,
-                            aiopquic_stream_cb,
-                            (void*)ctx);
+                            picoquic_current_time(), 0,
+                            sni_ptr, alpn_ptr, 1);
+                        if (new_cnx) {
+                            picoquic_set_callback(new_cnx, aiopquic_stream_cb,
+                                                  (void*)ctx);
+                            if (p->desired_version != 0) {
+                                picoquic_set_desired_version(new_cnx,
+                                                             p->desired_version);
+                            }
+                            if (picoquic_start_client_cnx(new_cnx) != 0) {
+                                picoquic_delete_cnx(new_cnx);
+                                new_cnx = NULL;
+                            }
+                        }
                         if (new_cnx) {
                             spsc_entry_t resp = {0};
                             resp.event_type = SPSC_EVT_ALMOST_READY;
