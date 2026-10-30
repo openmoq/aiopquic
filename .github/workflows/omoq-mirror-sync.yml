@@ -27,9 +27,7 @@ env:
   # every path it actually touches.
   FORK_PATHS: >-
     .github/workflows/omoq-mirror-sync.yml
-    .github/workflows/gemini-dispatch.yml
     .github/workflows/gemini-review.yml
-    .github/workflows/gemini-invoke.yml
 
 jobs:
   sync:
